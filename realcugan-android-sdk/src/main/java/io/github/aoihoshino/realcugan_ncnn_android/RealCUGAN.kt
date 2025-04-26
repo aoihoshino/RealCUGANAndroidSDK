@@ -100,35 +100,42 @@ class RealCUGAN private constructor(
         private external fun nativeRelease(handle: Long)
 
         /**
-         * 拷贝 assets/models → filesDir/models，然后 new 出一句柄
+         * 创建一个RealCUGAN实例。
+         * - 非必要请只创建一个实例
+         * - 请不要创建太多实例，以免导致堆栈溢出
+         *
+         * @param realCUGANOption 创建 RealCUGAN 的配置
+         * @see RealCUGANOption
+         * 拷贝了 assets/models → filesDir/models
          */
-        fun create(realCUGANOption: RealCUGANOption): RealCUGAN {
-            val option = realCUGANOption
-            val destRoot = File(option.context.filesDir, "models")
-            if (!destRoot.exists()) {
-                destRoot.mkdirs()
-                option.context.assets.list("models")?.forEach { subdir ->
-                    val dstSub = File(destRoot, subdir).apply { mkdirs() }
-                    option.context.assets.list("models/$subdir")?.forEach { fname ->
-                        option.context.assets.open("models/$subdir/$fname").use { inp ->
-                            FileOutputStream(File(dstSub, fname)).use { out ->
-                                inp.copyTo(out)
+        suspend fun create(realCUGANOption: RealCUGANOption): RealCUGAN =
+            withContext(Dispatchers.Default) {
+                val option = realCUGANOption
+                val destRoot = File(option.context.filesDir, "models")
+                if (!destRoot.exists()) {
+                    destRoot.mkdirs()
+                    option.context.assets.list("models")?.forEach { subdir ->
+                        val dstSub = File(destRoot, subdir).apply { mkdirs() }
+                        option.context.assets.list("models/$subdir")?.forEach { fname ->
+                            option.context.assets.open("models/$subdir/$fname").use { inp ->
+                                FileOutputStream(File(dstSub, fname)).use { out ->
+                                    inp.copyTo(out)
+                                }
                             }
                         }
                     }
                 }
+                val handle = nativeInitialize(
+                    destRoot.absolutePath,
+                    option.noise,
+                    option.scale,
+                    option.syncgap,
+                    option.modelName.dir,
+                    option.ttaMode,
+                    option.gpuId
+                )
+                require(handle >= 1L) { "RealCUGAN nativeInitialize failed: $handle" }
+                return@withContext RealCUGAN(handle, option.scale)
             }
-            val handle = nativeInitialize(
-                destRoot.absolutePath,
-                option.noise,
-                option.scale,
-                option.syncgap,
-                option.modelName.dir,
-                option.ttaMode,
-                option.gpuId
-            )
-            require(handle >= 1L) { "RealCUGAN nativeInitialize failed: $handle" }
-            return RealCUGAN(handle, option.scale)
-        }
     }
 }

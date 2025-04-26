@@ -18,29 +18,33 @@ class MainActivity : AppCompatActivity() {
     }
 
     // 待测 scale 列表（可以根据需要调）
-    private val scales = listOf(2, 3, 4)
+    private val scales = listOf(4)
     private lateinit var realCUGANs: List<RealCUGAN>
-    private val testFiles = listOf("test1.png", "test2.jpeg", "test3.png")
+    private val testFiles = listOf(
+        "test1.png",
+        "test2.png",
+        "test3.png"
+    )
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
         val imageView = findViewById<ImageView>(R.id.resultImageView)
 
-        // 1) 根据 scales 创建多个实例
-        realCUGANs = scales.map { scale ->
-            RealCUGAN.create(
-                RealCUGANOption(
-                    context = this,
-                    scale = scale
-                ),
-            )
-        }
-
         // 2) 并发跑每个实例对应一个文件
-        lifecycleScope.launch {
+        lifecycleScope.launch(Dispatchers.IO) {
+            // 1) 根据 scales 创建多个实例
+            realCUGANs = scales.map { scale ->
+                RealCUGAN.create(
+                    RealCUGANOption(
+                        context = this@MainActivity,
+                        scale = scale,
+                    ),
+                )
+            }
+
             // zip 保证文件名和实例一一对应
-            val jobs = testFiles.zip(realCUGANs).map { (filename, cg) ->
+            val jobs = testFiles.associateWith { realCUGANs.first() }.map { (filename, cg) ->
                 async(Dispatchers.IO) {
                     // IO 线程读取压缩数据
                     val bytes = assets.open(filename).use { input ->
@@ -54,7 +58,7 @@ class MainActivity : AppCompatActivity() {
 
             // 等待并依次更新 UI
             val timeCost = measureTime {
-            for (job in jobs) {
+                for (job in jobs) {
                     val (filename, bmp) = job.await()
                     // Main 线程更新界面
                     withContext(Dispatchers.Main) {

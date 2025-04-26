@@ -13,6 +13,7 @@
 
 #define LOG_TAG "RealCUGAN_NCNN_ANDROID_NATIVE"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 // ncnn初始化锁
@@ -57,6 +58,9 @@ Java_io_github_aoihoshino_realcugan_1ncnn_1android_RealCUGAN_nativeInitialize(
         jobject ttaModeObj,
         jobject gpuidObj
 ) {
+    if (g_instances.size() > 1) {
+        LOGW("nativeInitialize: You have loaded more than one RealCUGAN instance. Too many RealCUGAN model being loaded can cause the heap to grow too large, leading to OOM.");
+    }
     // 1. 异常类
     jclass runtimeExc = env->FindClass("java/lang/RuntimeException");
     if (!runtimeExc) return -1;
