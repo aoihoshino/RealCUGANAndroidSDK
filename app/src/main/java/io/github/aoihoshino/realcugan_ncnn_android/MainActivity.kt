@@ -22,7 +22,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var realCUGANs: List<RealCUGAN>
     private val testFiles = listOf(
         "test1.png",
-        "test2.png",
+        "test2.jpeg",
         "test3.png"
     )
 
