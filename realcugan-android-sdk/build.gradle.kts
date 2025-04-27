@@ -3,10 +3,12 @@ plugins {
     alias(libs.plugins.kotlin.android)
 }
 
+group = "com.github.aoihoshino"
+version = "1.0.0"
+
 android {
     namespace = "io.github.aoihoshino.realcugan_ncnn_android"
     compileSdk = 35
-    version = "1.0.0"
 
     defaultConfig {
         minSdk = 24
