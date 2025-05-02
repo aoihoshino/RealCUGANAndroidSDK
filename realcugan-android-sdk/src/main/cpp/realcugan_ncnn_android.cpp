@@ -1,5 +1,6 @@
 #include <jni.h>
 #include <string>
+#include <sstream>
 #include <android/log.h>
 #include <android/bitmap.h>
 #include "realcugan.h"
@@ -16,13 +17,68 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
+struct CUGANParams {
+    int noise;
+    int scale;
+    int syncgap;
+    bool ttaMode;
+    int gpuId;
+    std::string modelDir;
+
+    bool operator==(const CUGANParams &o) const noexcept {
+        return noise == o.noise
+               && scale == o.scale
+               && syncgap == o.syncgap
+               && ttaMode == o.ttaMode
+               && gpuId == o.gpuId
+               && modelDir == o.modelDir;
+    }
+
+    std::string toString() const {
+        std::ostringstream oss;
+        oss << "CUGANParams{"
+            << "noise=" << noise << ", "
+            << "scale=" << scale << ", "
+            << "syncgap=" << syncgap << ", "
+            << "ttaMode=" << (ttaMode ? "true" : "false") << ", "
+            << "gpuId=" << gpuId << ", "
+            << "modelDir=\"" << modelDir << "\""
+            << "}";
+        return oss.str();
+    }
+};
+
+namespace std {
+    template<>
+    struct hash<CUGANParams> {
+        size_t operator()(CUGANParams const &p) const noexcept {
+            size_t h = std::hash<int>()(p.noise);
+            auto mix = [&](auto v) {
+                h ^= std::hash<decltype(v)>()(v)
+                     + 0x9e3779b97f4a7c15 + (h << 6) + (h >> 2);
+            };
+            mix(p.scale);
+            mix(p.syncgap);
+            mix(p.ttaMode);
+            mix(p.gpuId);
+            mix(p.modelDir);
+            return h;
+        }
+    };
+}
+
+struct CUGANEntry {
+    jlong handle;
+    RealCUGAN *inst;
+};
+
 // ncnn初始化锁
 static std::mutex gpu_mutex;
 static bool gpu_initialized = false;
 
 // realcugan序列锁
-static std::mutex g_map_mutex;
-static std::unordered_map<jlong, RealCUGAN *> g_instances;
+static std::mutex g_cache_mutex;
+static std::unordered_map<CUGANParams, CUGANEntry> g_cache;
 
 // handler
 static std::mutex handler_mutex;
@@ -40,11 +96,27 @@ void ensure_ncnn_gpu() {
 // 如果空了，就销毁 GPU 并允许下次 re-init
 void release_ncnn_gpu() {
     std::lock_guard<std::mutex> lg(gpu_mutex);
-    std::lock_guard<std::mutex> lg2(g_map_mutex);
-    if (g_instances.empty() && gpu_initialized) {
+    std::lock_guard<std::mutex> lg2(g_cache_mutex);
+    if (g_cache.empty() && gpu_initialized) {
         ncnn::destroy_gpu_instance();
         gpu_initialized = false;
     }
+}
+
+RealCUGAN *find_realcugan(jlong handle) {
+    RealCUGAN *inst = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_cache_mutex);
+        for (auto &kv: g_cache) {
+            if (kv.second.handle == handle) {
+                LOGI("found realcugan: handle=%lld inst=%p options=%s", handle, inst,
+                     kv.first.toString().c_str());
+                inst = kv.second.inst;
+                break;
+            }
+        }
+    }
+    return inst;
 }
 
 extern "C" JNIEXPORT jlong JNICALL
@@ -58,7 +130,7 @@ Java_io_github_aoihoshino_realcugan_1ncnn_1android_RealCUGAN_nativeInitialize(
         jobject ttaModeObj,
         jobject gpuidObj
 ) {
-    if (g_instances.size() > 1) {
+    if (!g_cache.empty()) {
         LOGW("nativeInitialize: You have loaded more than one RealCUGAN instance. Too many RealCUGAN model being loaded can cause the heap to grow too large, leading to OOM.");
     }
     // 1. 异常类
@@ -76,6 +148,12 @@ Java_io_github_aoihoshino_realcugan_1ncnn_1android_RealCUGAN_nativeInitialize(
     int syncgap = syncgapObj ? env->CallIntMethod(syncgapObj, intValueID) : 3;
     bool ttaMode = ttaModeObj && env->CallBooleanMethod(ttaModeObj, boolValueID);
     int numThreads = 1;
+    std::string modelDir;
+    if (modelNameJ) {
+        const char *tmp = env->GetStringUTFChars(modelNameJ, nullptr);
+        if (tmp && *tmp) modelDir = tmp;
+        env->ReleaseStringUTFChars(modelNameJ, tmp);
+    }
 
     // 3. GPU 初始化
     int gpuId;
@@ -93,6 +171,15 @@ Java_io_github_aoihoshino_realcugan_1ncnn_1android_RealCUGAN_nativeInitialize(
     if (gpuId == -1) release_ncnn_gpu();
     LOGI("initialize(): using GPU %d", gpuId);
 
+    CUGANParams key{noise, scale, syncgap, ttaMode, gpuId, modelDir};
+    {
+        std::lock_guard<std::mutex> lk(g_cache_mutex);
+        auto it = g_cache.find(key);
+        if (it != g_cache.end()) {
+            return it->second.handle;
+        }
+    }
+
     // 4. 基本边界检查（syncgap, gpuId 先行）
     if (syncgap < 0 || syncgap > 3) {
         LOGE("initialize(): invalid syncgap %d", syncgap);
@@ -100,14 +187,7 @@ Java_io_github_aoihoshino_realcugan_1ncnn_1android_RealCUGAN_nativeInitialize(
         return -1;
     }
 
-    // 5. 解析 modelName -> modelDir
-    std::string modelDir;
-    if (modelNameJ) {
-        const char *tmp = env->GetStringUTFChars(modelNameJ, nullptr);
-        if (tmp && *tmp) modelDir = tmp;
-        env->ReleaseStringUTFChars(modelNameJ, tmp);
-    }
-    // nose 模型强制关 syncgap
+    // 5. nose 模型强制关 syncgap
     if (modelDir == "models-nose") {
         syncgap = 0;
     }
@@ -248,25 +328,29 @@ Java_io_github_aoihoshino_realcugan_1ncnn_1android_RealCUGAN_nativeInitialize(
     inst->prepadding = prepadding;
     inst->tilesize = tilesize;
 
-    int ret = inst->load(paramFull, modelFull);
-    if (ret != 0) {
-        LOGE("initialize: RealCUGAN::load failed (%d)", ret);
-        delete inst;
-        release_ncnn_gpu();
-        return ret;
-    }
-
-    // 11. 注册实例并返回 handle
-    jlong handle;
     try {
-        std::lock_guard<std::mutex> lg(handler_mutex);
-        handle = next_handle++;
-        std::lock_guard<std::mutex> lg2(g_map_mutex);
-        g_instances[handle] = inst;
+        int ret = inst->load(paramFull, modelFull);
+        if (ret != 0) {
+            LOGE("initialize: RealCUGAN::load failed (%d)", ret);
+            delete inst;
+            release_ncnn_gpu();
+            return ret;
+        }
     }
     catch (const std::exception &e) {
         env->ThrowNew(runtimeExc, e.what());
         return -1;
+    }
+
+    // 11. 注册实例并返回 handle
+    jlong handle;
+    {
+        std::lock_guard<std::mutex> lg(handler_mutex);
+        handle = next_handle++;
+    }
+    {
+        std::lock_guard<std::mutex> lk2(g_cache_mutex);
+        g_cache[key] = CUGANEntry{handle, inst};
     }
     return handle;
 }
@@ -284,13 +368,7 @@ Java_io_github_aoihoshino_realcugan_1ncnn_1android_RealCUGAN_nativeProcessImage(
     if (!runtimeExc) {
         return nullptr; // 如果连 RuntimeException 都找不到，直接回
     }
-    RealCUGAN *inst = nullptr;
-    {
-        std::lock_guard<std::mutex> guard(g_map_mutex);
-        auto it = g_instances.find(handle);
-        if (it != g_instances.end())
-            inst = it->second;
-    }
+    RealCUGAN *inst = find_realcugan(handle);
     if (!inst) {
         LOGE("processImage: instance of handle %lld not found", handle);
         return nullptr;
@@ -387,17 +465,13 @@ Java_io_github_aoihoshino_realcugan_1ncnn_1android_RealCUGAN_nativeProcessImage(
 extern "C" JNIEXPORT void JNICALL
 Java_io_github_aoihoshino_realcugan_1ncnn_1android_RealCUGAN_nativeRelease(
         JNIEnv * /*env*/, jclass, jlong handle) {
-    // 1) 删除RealCUGAN实例
-    RealCUGAN *inst = nullptr;
-    {
-        std::lock_guard lk(g_map_mutex);
-        auto it = g_instances.find(handle);
-        if (it != g_instances.end()) {
-            inst = it->second;
-            g_instances.erase(it);
+    std::lock_guard<std::mutex> lk(g_cache_mutex);
+    for (auto it = g_cache.begin(); it != g_cache.end(); ++it) {
+        if (it->second.handle == handle) {
+            delete it->second.inst;
+            g_cache.erase(it);
+            release_ncnn_gpu();
+            break;
         }
     }
-    delete inst;
-
-    release_ncnn_gpu();
 }

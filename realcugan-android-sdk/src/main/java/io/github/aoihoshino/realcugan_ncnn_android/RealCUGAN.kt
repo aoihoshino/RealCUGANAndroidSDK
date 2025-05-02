@@ -20,8 +20,12 @@ class RealCUGAN private constructor(
 ) {
     // 只有调用 nativeProcessImage 部分运行在这个 dispatcher 上
     private val gpuDispatcher: CoroutineDispatcher by lazy {
-        Executors.newCachedThreadPool { Thread(it, "RealCUGAN-GPU") }
-            .asCoroutineDispatcher()
+        Executors.newCachedThreadPool {
+            Thread(it, "RealCUGAN-GPU").apply {
+                priority = Thread.MAX_PRIORITY
+                isDaemon = true
+            }
+        }.asCoroutineDispatcher()
     }
 
     /**
