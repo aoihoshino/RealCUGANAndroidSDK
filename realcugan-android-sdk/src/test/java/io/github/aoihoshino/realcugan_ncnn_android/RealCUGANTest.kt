@@ -4,20 +4,17 @@ import ModelName
 import RealCUGANOption
 import android.content.Context
 import android.content.res.AssetManager
-import android.graphics.Bitmap
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
-import org.junit.Assert.fail
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import org.mockito.Mockito.mock
 import org.mockito.Mockito.`when`
 import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
 import java.io.File
 
 class ModelNameTest {
@@ -48,7 +45,7 @@ class RealCUGANOptionTest {
         assertEquals(3, opts.syncgap)
         assertEquals(ModelName.SE, opts.modelName)
         assertFalse(opts.ttaMode)
-        assertEquals(0, opts.gpuId)
+        assertEquals(null, opts.gpuId)
     }
 
     // —— syncgap 边界测试 ——
@@ -168,4 +165,47 @@ class RealCUGANTest {
             "up4x-no-denoise.bin", "up4x-no-denoise.param"
         )
     )
+
+    @Test
+    fun `create should copy entire models directory to filesDir before native init`() = runBlocking {
+        // Arrange
+        val context = mock(Context::class.java)
+        val assets = mock(AssetManager::class.java)
+        `when`(context.assets).thenReturn(assets)
+
+        // stub list("models") and list("models/<subdir>")
+        `when`(assets.list("models")).thenReturn(modelStructure.keys.toTypedArray())
+        modelStructure.forEach { (subdir, files) ->
+            `when`(assets.list("models/$subdir")).thenReturn(files.toTypedArray())
+            files.forEach { fname ->
+                val content = "dummy-$subdir-$fname".toByteArray()
+                `when`(assets.open("models/$subdir/$fname"))
+                    .thenReturn(ByteArrayInputStream(content))
+            }
+        }
+
+        // filesDir → temp folder
+        val filesDir = tempFolder.root
+        `when`(context.filesDir).thenReturn(filesDir)
+
+        // Act
+        RealCUGAN.copyModels(context)
+
+        // Assert: verify all files copied
+        modelStructure.forEach { (subdir, files) ->
+            files.forEach { fname ->
+                val destFile = File(filesDir, "models/$subdir/$fname")
+                assertTrue(
+                    "File models/$subdir/$fname should exist",
+                    destFile.exists()
+                )
+                val expected = "dummy-$subdir-$fname".toByteArray()
+                assertArrayEquals(
+                    "Content of $fname in $subdir should match",
+                    expected,
+                    destFile.readBytes()
+                )
+            }
+        }
+    }
 }

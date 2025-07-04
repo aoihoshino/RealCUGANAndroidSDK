@@ -1,6 +1,7 @@
 package io.github.aoihoshino.realcugan_ncnn_android
 
 import RealCUGANOption
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.Log
@@ -79,10 +80,6 @@ class RealCUGAN private constructor(
     }
 
     companion object {
-        init {
-            System.loadLibrary("realcugan_ncnn_android")
-        }
-
         @JvmStatic
         private external fun nativeInitialize(
             modelRoot: String?,
@@ -114,32 +111,37 @@ class RealCUGAN private constructor(
          */
         suspend fun create(realCUGANOption: RealCUGANOption): RealCUGAN =
             withContext(Dispatchers.Default) {
-                val option = realCUGANOption
-                val destRoot = File(option.context.filesDir, "models")
-                if (!destRoot.exists()) {
-                    destRoot.mkdirs()
-                    option.context.assets.list("models")?.forEach { subdir ->
-                        val dstSub = File(destRoot, subdir).apply { mkdirs() }
-                        option.context.assets.list("models/$subdir")?.forEach { fname ->
-                            option.context.assets.open("models/$subdir/$fname").use { inp ->
-                                FileOutputStream(File(dstSub, fname)).use { out ->
-                                    inp.copyTo(out)
-                                }
+                System.loadLibrary("realcugan_ncnn_android")
+                val destRoot = copyModels(context = realCUGANOption.context)
+                val handle = nativeInitialize(
+                    destRoot.absolutePath,
+                    realCUGANOption.noise,
+                    realCUGANOption.scale,
+                    realCUGANOption.syncgap,
+                    realCUGANOption.modelName.dir,
+                    realCUGANOption.ttaMode,
+                    realCUGANOption.gpuId
+                )
+                require(handle >= 1L) { "RealCUGAN nativeInitialize failed: $handle" }
+                return@withContext RealCUGAN(handle, realCUGANOption.scale)
+            }
+
+        internal fun copyModels(context: Context): File {
+            val destRoot = File(context.filesDir, "models")
+            if (!destRoot.exists()) {
+                destRoot.mkdirs()
+                context.assets.list("models")?.forEach { subdir ->
+                    val dstSub = File(destRoot, subdir).apply { mkdirs() }
+                    context.assets.list("models/$subdir")?.forEach { fname ->
+                        context.assets.open("models/$subdir/$fname").use { inp ->
+                            FileOutputStream(File(dstSub, fname)).use { out ->
+                                inp.copyTo(out)
                             }
                         }
                     }
                 }
-                val handle = nativeInitialize(
-                    destRoot.absolutePath,
-                    option.noise,
-                    option.scale,
-                    option.syncgap,
-                    option.modelName.dir,
-                    option.ttaMode,
-                    option.gpuId
-                )
-                require(handle >= 1L) { "RealCUGAN nativeInitialize failed: $handle" }
-                return@withContext RealCUGAN(handle, option.scale)
             }
+            return destRoot
+        }
     }
 }

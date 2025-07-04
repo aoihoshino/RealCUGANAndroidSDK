@@ -5,11 +5,11 @@ plugins {
 }
 
 group = "io.github.aoihoshino"
-version = "1.0.2"
+version = "1.0.3"
 
 android {
     namespace = "io.github.aoihoshino.realcugan_ncnn_android"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         minSdk = 24
@@ -21,7 +21,8 @@ android {
                 arguments += listOf(
                     "-DANDROID_TOOLCHAIN=clang",
                     "-DANDROID_STL=c++_static",
-                    "-DCMAKE_BUILD_TYPE=Debug"    // 确保是 Debug 模式
+                    "-DCMAKE_BUILD_TYPE=Debug",    // 确保是 Debug 模式
+                    "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"
                 )
                 cppFlags += listOf("-g")
             }
@@ -66,8 +67,8 @@ android {
     }
 }
 
+val mockitoAgent = configurations.create("mockitoAgent")
 dependencies {
-
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)
     implementation(libs.material)
@@ -75,7 +76,6 @@ dependencies {
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     testImplementation(libs.mockito.core)
-    testImplementation(libs.mockito.inline)
 }
 
 afterEvaluate {
