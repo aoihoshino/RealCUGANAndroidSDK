@@ -6,6 +6,7 @@ import android.util.Log
 import android.widget.ImageView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
@@ -46,12 +47,22 @@ class MainActivity : AppCompatActivity() {
             // zip 保证文件名和实例一一对应
             val jobs = testFiles.associateWith { realCUGANs.first() }.map { (filename, cg) ->
                 async(Dispatchers.IO) {
+                    val localName = filename
                     // IO 线程读取压缩数据
                     val bytes = assets.open(filename).use { input ->
                         input.readBytes()
                     }
                     // 调用 suspend 版 process（内部会切到 gpuDispatcher）
-                    val bmp = cg.process(bytes)
+                    val bmp = cg.process(
+                        bytes
+                    ) { percent ->
+                        CoroutineScope(Dispatchers.Main).launch {
+                            Log.i(
+                                TAG,
+                                "$localName Processing $percent%"
+                            )
+                        }
+                    }
                     filename to bmp
                 }
             }

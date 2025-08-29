@@ -5,6 +5,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.Log
+import androidx.annotation.Keep
 import androidx.core.graphics.createBitmap
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
@@ -14,6 +15,11 @@ import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
+
+@Keep
+fun interface ProgressListener {
+    fun onProgress(percent: Float)
+}
 
 class RealCUGAN private constructor(
     private val nativeHandle: Long,
@@ -33,47 +39,48 @@ class RealCUGAN private constructor(
      * 对一段 PNG/JPEG/WebP 的字节做推理，返回 ARGB_8888 的 Bitmap。
      * 全流程：头部解码 → JNI 计算(切到 gpuDispatcher) → 拼装输出 Bitmap
      */
-    suspend fun process(imageData: ByteArray): Bitmap = withContext(Dispatchers.IO) {
-        // 1) 先解一次头，拿到原始尺寸
-        val srcBmp = BitmapFactory.decodeByteArray(imageData, 0, imageData.size)
-        val outW = srcBmp.width * scaleFactor
-        val outH = srcBmp.height * scaleFactor
+    suspend fun process(imageData: ByteArray, onProgressListener: ProgressListener? = null): Bitmap =
+        withContext(Dispatchers.IO) {
+            // 1) 先解一次头，拿到原始尺寸
+            val srcBmp = BitmapFactory.decodeByteArray(imageData, 0, imageData.size)
+            val outW = srcBmp.width * scaleFactor
+            val outH = srcBmp.height * scaleFactor
 
-        // 2) 真正跑 native 推理，只在 gpuDispatcher 线程池
-        val raw = withContext(gpuDispatcher) {
-            nativeProcessImage(nativeHandle, imageData)
-        }
-
-        // 3) 拼装输出 Bitmap（IO 线程）
-        val outBmp = createBitmap(outW, outH)
-        when (raw.size) {
-            // RGBA
-            outW * outH * 4 -> {
-                ByteBuffer
-                    .wrap(raw)
-                    .let { outBmp.copyPixelsFromBuffer(it) }
+            // 2) 真正跑 native 推理，只在 gpuDispatcher 线程池
+            val raw = withContext(gpuDispatcher) {
+                nativeProcessImage(nativeHandle, imageData, onProgressListener)
             }
-            // RGB → 补 alpha
-            outW * outH * 3 -> {
-                val buf = ByteBuffer.allocate(outW * outH * 4)
-                var i = 0
-                repeat(outW * outH) {
-                    buf.put(raw[i++])
-                    buf.put(raw[i++])
-                    buf.put(raw[i++])
-                    buf.put(0xFF.toByte())
+
+            // 3) 拼装输出 Bitmap（IO 线程）
+            val outBmp = createBitmap(outW, outH)
+            when (raw.size) {
+                // RGBA
+                outW * outH * 4 -> {
+                    ByteBuffer
+                        .wrap(raw)
+                        .let { outBmp.copyPixelsFromBuffer(it) }
                 }
-                buf.rewind()
-                outBmp.copyPixelsFromBuffer(buf)
-            }
+                // RGB → 补 alpha
+                outW * outH * 3 -> {
+                    val buf = ByteBuffer.allocate(outW * outH * 4)
+                    var i = 0
+                    repeat(outW * outH) {
+                        buf.put(raw[i++])
+                        buf.put(raw[i++])
+                        buf.put(raw[i++])
+                        buf.put(0xFF.toByte())
+                    }
+                    buf.rewind()
+                    outBmp.copyPixelsFromBuffer(buf)
+                }
 
-            else -> throw RuntimeException(
-                "Unexpected pixel buffer size: ${raw.size}, expected ${outW * outH * 3} or ${outW * outH * 4}"
-            )
+                else -> throw RuntimeException(
+                    "Unexpected pixel buffer size: ${raw.size}, expected ${outW * outH * 3} or ${outW * outH * 4}"
+                )
+            }
+            Log.i("RealCUGAN", "process → Bitmap ready $outW×$outH")
+            outBmp
         }
-        Log.i("RealCUGAN", "process → Bitmap ready $outW×$outH")
-        outBmp
-    }
 
     fun release() {
         nativeRelease(nativeHandle)
@@ -94,7 +101,8 @@ class RealCUGAN private constructor(
         @JvmStatic
         private external fun nativeProcessImage(
             handle: Long,
-            imageData: ByteArray
+            imageData: ByteArray,
+            progressListener: ProgressListener?
         ): ByteArray
 
         @JvmStatic
@@ -120,7 +128,7 @@ class RealCUGAN private constructor(
                     realCUGANOption.syncgap,
                     realCUGANOption.modelName.dir,
                     realCUGANOption.ttaMode,
-                    realCUGANOption.gpuId
+                    realCUGANOption.gpuId,
                 )
                 require(handle >= 1L) { "RealCUGAN nativeInitialize failed: $handle" }
                 return@withContext RealCUGAN(handle, realCUGANOption.scale)

@@ -1,6 +1,7 @@
 #include <jni.h>
 #include <string>
 #include <sstream>
+#include <functional>
 #include <android/log.h>
 #include <android/bitmap.h>
 #include "realcugan.h"
@@ -15,7 +16,30 @@
 #define LOG_TAG "RealCUGAN_NCNN_ANDROID_NATIVE"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
+
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+struct ProgressCallback {
+    JavaVM* vm = nullptr;
+    jobject cbGlobal = nullptr;         // Global ref to the ProgressListener object
+    jmethodID midOnProgressF = nullptr; // void onProgress(float)
+};
+
+static void call_progress(ProgressCallback* pcb, float percent) {
+    if (!pcb || !pcb->cbGlobal || !pcb->midOnProgressF) return;
+
+    JNIEnv* env = nullptr;
+    bool didAttach = false;
+    if (pcb->vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (pcb->vm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
+        didAttach = true;
+    }
+
+    env->CallVoidMethod(pcb->cbGlobal, pcb->midOnProgressF, percent);
+
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+    if (didAttach) pcb->vm->DetachCurrentThread();
+}
 
 struct CUGANParams {
     int noise;
@@ -109,9 +133,9 @@ RealCUGAN *find_realcugan(jlong handle) {
         std::lock_guard<std::mutex> lk(g_cache_mutex);
         for (auto &kv: g_cache) {
             if (kv.second.handle == handle) {
-                LOGI("found realcugan: handle=%lld inst=%p options=%s", handle, inst,
-                     kv.first.toString().c_str());
                 inst = kv.second.inst;
+                LOGI("found realcugan: handle=%ld inst=%p options=%s",
+                     (long)handle, (void*)inst, kv.first.toString().c_str());
                 break;
             }
         }
@@ -148,6 +172,7 @@ Java_io_github_aoihoshino_realcugan_1ncnn_1android_RealCUGAN_nativeInitialize(
     int syncgap = syncgapObj ? env->CallIntMethod(syncgapObj, intValueID) : 3;
     bool ttaMode = ttaModeObj && env->CallBooleanMethod(ttaModeObj, boolValueID);
     int numThreads = 1;
+
     std::string modelDir;
     if (modelNameJ) {
         const char *tmp = env->GetStringUTFChars(modelNameJ, nullptr);
@@ -360,7 +385,8 @@ extern "C" JNIEXPORT jbyteArray JNICALL
 Java_io_github_aoihoshino_realcugan_1ncnn_1android_RealCUGAN_nativeProcessImage(
         JNIEnv *env, jclass /*clazz*/,
         jlong handle,
-        jbyteArray imageData) {
+        jbyteArray imageData,
+        jobject onProgressFunction) {
     // —— 1) 找到对应的 RealCUGAN 实例 —————————————
     // 1) Find the right instance under lock
     // 先声明要抛出的异常类
@@ -428,23 +454,65 @@ Java_io_github_aoihoshino_realcugan_1ncnn_1android_RealCUGAN_nativeProcessImage(
     ncnn::Mat out_mat(w * scale, h * scale, (size_t) in_mat.elemsize, (int) in_mat.elemsize);
 
     // 7) 运行模型
+    // ---- Thread-safe progress callback (ProgressListener.onProgress(float)) ----
+    ProgressCallback* pcb = nullptr;
+    std::function<void(float)> progressCb; // empty by default
+
+    if (onProgressFunction) {
+        pcb = new ProgressCallback();
+        env->GetJavaVM(&pcb->vm);
+
+        // Promote the ProgressListener object to a GlobalRef
+        pcb->cbGlobal = env->NewGlobalRef(onProgressFunction);
+        jclass cbCls = env->GetObjectClass(onProgressFunction);
+
+        // Expect a method: void onProgress(float)
+        pcb->midOnProgressF = env->GetMethodID(cbCls, "onProgress", "(F)V");
+        env->DeleteLocalRef(cbCls);
+
+        if (!pcb->midOnProgressF) {
+            LOGW("ProgressListener does not implement void onProgress(float); progress will be ignored.");
+        } else {
+            // Lambda that is safe to call from any thread used by ncnn/RealCUGAN
+            progressCb = [pcb](float percent) { call_progress(pcb, percent); };
+        }
+    }
+
     try {
         LOGI("processImage: processing");
-        if (inst->process(in_mat, out_mat) != 0) {
+        if (inst->process(in_mat, out_mat, progressCb) != 0) {
             LOGE("processImage: model process failed");
             free(in_mat);
             free(out_mat);
+            if (pcb) {
+                env->DeleteGlobalRef(pcb->cbGlobal);
+                delete pcb;
+                pcb = nullptr;
+            }
             return nullptr;
         }
         free(pixeldata);
         LOGI("processImage: process ends");
+        if (pcb) {
+            env->DeleteGlobalRef(pcb->cbGlobal);
+            delete pcb;
+            pcb = nullptr;
+        }
     } catch (const std::exception &e) {
-        // C++ 异常
         env->ThrowNew(runtimeExc, e.what());
+        if (pcb) {
+            env->DeleteGlobalRef(pcb->cbGlobal);
+            delete pcb;
+            pcb = nullptr;
+        }
         return nullptr;
     } catch (...) {
-        // 任何其他崩溃
         env->ThrowNew(runtimeExc, "Unknown native error in RealCUGAN");
+        if (pcb) {
+            env->DeleteGlobalRef(pcb->cbGlobal);
+            delete pcb;
+            pcb = nullptr;
+        }
         return nullptr;
     }
 
