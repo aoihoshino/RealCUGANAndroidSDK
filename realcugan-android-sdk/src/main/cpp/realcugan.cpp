@@ -245,7 +245,7 @@ int RealCUGAN::load(const std::string &parampath, const std::string &modelpath)
 }
 
 int RealCUGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage,
-                       const std::function<void(float)> progress_listener) const {
+                       const std::function<void(float)> &progress_listener) const {
     bool syncgap_needed = tilesize < std::max(inimage.w, inimage.h);
 
     if (!vkdev) {
@@ -739,7 +739,7 @@ int RealCUGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage,
 }
 
 int RealCUGAN::process_cpu(const ncnn::Mat &inimage, ncnn::Mat &outimage,
-                           const std::function<void(float)> progress_listener) const {
+                           const std::function<void(float)> &progress_listener) const {
     if (noise == -1 && scale == 1) {
         outimage = inimage;
         return 0;
@@ -834,6 +834,8 @@ int RealCUGAN::process_cpu(const ncnn::Mat &inimage, ncnn::Mat &outimage,
                     }
                 }
 
+                // alpha tile cut to nopad size (CPU tta fix)
+                ncnn::Mat in_alpha_tile_nocrop;
                 // border padding
                 {
                     int pad_top = std::max(prepadding - yi * TILE_SIZE_Y, 0);
@@ -848,6 +850,13 @@ int RealCUGAN::process_cpu(const ncnn::Mat &inimage, ncnn::Mat &outimage,
                     ncnn::copy_make_border(in_tile[0], in_tile_padded, pad_top, pad_bottom,
                                            pad_left, pad_right, 2, 0.f, net.opt);
                     in_tile[0] = in_tile_padded;
+
+                    if (channels == 4) {
+                        ncnn::copy_cut_border(in_alpha_tile,
+                                              in_alpha_tile_nocrop,
+                                              pad_top, pad_bottom, pad_left, pad_right,
+                                              opt);
+                    }
                 }
 
                 // the other 7 directions
@@ -910,16 +919,16 @@ int RealCUGAN::process_cpu(const ncnn::Mat &inimage, ncnn::Mat &outimage,
                 ncnn::Mat out_alpha_tile;
                 if (channels == 4) {
                     if (scale == 1) {
-                        out_alpha_tile = in_alpha_tile;
+                        out_alpha_tile = in_alpha_tile_nocrop;
                     }
                     if (scale == 2) {
-                        bicubic_2x->forward(in_alpha_tile, out_alpha_tile, opt);
+                        bicubic_2x->forward(in_alpha_tile_nocrop, out_alpha_tile, opt);
                     }
                     if (scale == 3) {
-                        bicubic_3x->forward(in_alpha_tile, out_alpha_tile, opt);
+                        bicubic_3x->forward(in_alpha_tile_nocrop, out_alpha_tile, opt);
                     }
                     if (scale == 4) {
-                        bicubic_4x->forward(in_alpha_tile, out_alpha_tile, opt);
+                        bicubic_4x->forward(in_alpha_tile_nocrop, out_alpha_tile, opt);
                     }
                 }
 
@@ -1009,6 +1018,7 @@ int RealCUGAN::process_cpu(const ncnn::Mat &inimage, ncnn::Mat &outimage,
                 // split alpha and preproc
                 ncnn::Mat in_tile;
                 ncnn::Mat in_alpha_tile;
+                ncnn::Mat in_alpha_tile_nocrop;
                 {
                     in_tile.create(in.w, in.h, 3);
                     for (int q = 0; q < 3; q++) {
@@ -1039,6 +1049,31 @@ int RealCUGAN::process_cpu(const ncnn::Mat &inimage, ncnn::Mat &outimage,
                     ncnn::copy_make_border(in_tile, in_tile_padded, pad_top, pad_bottom, pad_left,
                                            pad_right, 2, 0.f, net.opt);
                     in_tile = in_tile_padded;
+
+                    // alpha tile cut to nopad
+                    if (channels == 4) {
+                        ncnn::copy_cut_border(
+                            in_alpha_tile,
+                            in_alpha_tile_nocrop,
+                            pad_top, pad_bottom, pad_left, pad_right,
+                            opt);
+                    }
+                }
+
+                // alpha tile cut to nopad size (CPU non-tta fix)
+                if (channels == 4) {
+                    int pad_top = std::max(prepadding - yi * TILE_SIZE_Y, 0);
+                    int pad_bottom = std::max(
+                            std::min((yi + 1) * TILE_SIZE_Y + prepadding_bottom - h,
+                                     prepadding_bottom), 0);
+                    int pad_left = std::max(prepadding - xi * TILE_SIZE_X, 0);
+                    int pad_right = std::max(std::min((xi + 1) * TILE_SIZE_X + prepadding_right - w,
+                                                      prepadding_right), 0);
+
+                    ncnn::copy_cut_border(in_alpha_tile,
+                                          in_alpha_tile_nocrop,
+                                          pad_top, pad_bottom, pad_left, pad_right,
+                                          net.opt);
                 }
 
                 // realcugan
@@ -1054,16 +1089,16 @@ int RealCUGAN::process_cpu(const ncnn::Mat &inimage, ncnn::Mat &outimage,
                 ncnn::Mat out_alpha_tile;
                 if (channels == 4) {
                     if (scale == 1) {
-                        out_alpha_tile = in_alpha_tile;
+                        out_alpha_tile = in_alpha_tile_nocrop;
                     }
                     if (scale == 2) {
-                        bicubic_2x->forward(in_alpha_tile, out_alpha_tile, opt);
+                        bicubic_2x->forward(in_alpha_tile_nocrop, out_alpha_tile, opt);
                     }
                     if (scale == 3) {
-                        bicubic_3x->forward(in_alpha_tile, out_alpha_tile, opt);
+                        bicubic_3x->forward(in_alpha_tile_nocrop, out_alpha_tile, opt);
                     }
                     if (scale == 4) {
-                        bicubic_4x->forward(in_alpha_tile, out_alpha_tile, opt);
+                        bicubic_4x->forward(in_alpha_tile_nocrop, out_alpha_tile, opt);
                     }
                 }
 
@@ -1135,7 +1170,7 @@ int RealCUGAN::process_cpu(const ncnn::Mat &inimage, ncnn::Mat &outimage,
 }
 
 int RealCUGAN::process_se(const ncnn::Mat &inimage, ncnn::Mat &outimage,
-                          const std::function<void(float)> progress_listener) const {
+                          const std::function<void(float)> &progress_listener) const {
     ncnn::VkAllocator *blob_vkallocator = vkdev->acquire_blob_allocator();
     ncnn::VkAllocator *staging_vkallocator = vkdev->acquire_staging_allocator();
 
@@ -1186,7 +1221,7 @@ int RealCUGAN::process_se(const ncnn::Mat &inimage, ncnn::Mat &outimage,
 }
 
 int RealCUGAN::process_se_rough(const ncnn::Mat &inimage, ncnn::Mat &outimage,
-                                const std::function<void(float)> progress_listener) const {
+                                const std::function<void(float)> &progress_listener) const {
     ncnn::VkAllocator *blob_vkallocator = vkdev->acquire_blob_allocator();
     ncnn::VkAllocator *staging_vkallocator = vkdev->acquire_staging_allocator();
 
@@ -1216,7 +1251,7 @@ int RealCUGAN::process_se_rough(const ncnn::Mat &inimage, ncnn::Mat &outimage,
 }
 
 int RealCUGAN::process_se_very_rough(const ncnn::Mat &inimage, ncnn::Mat &outimage,
-                                     const std::function<void(float)> progress_listener) const {
+                                     const std::function<void(float)> &progress_listener) const {
     ncnn::VkAllocator *blob_vkallocator = vkdev->acquire_blob_allocator();
     ncnn::VkAllocator *staging_vkallocator = vkdev->acquire_staging_allocator();
 
@@ -1246,7 +1281,7 @@ int RealCUGAN::process_se_very_rough(const ncnn::Mat &inimage, ncnn::Mat &outima
 }
 
 int RealCUGAN::process_cpu_se(const ncnn::Mat &inimage, ncnn::Mat &outimage,
-                              const std::function<void(float)> progress_listener) const {
+                              const std::function<void(float)> &progress_listener) const {
     FeatureCache cache;
 
     std::vector<std::string> in0 = {};
@@ -1286,7 +1321,7 @@ int RealCUGAN::process_cpu_se(const ncnn::Mat &inimage, ncnn::Mat &outimage,
 }
 
 int RealCUGAN::process_cpu_se_rough(const ncnn::Mat &inimage, ncnn::Mat &outimage,
-                                    const std::function<void(float)> progress_listener) const {
+                                    const std::function<void(float)> &progress_listener) const {
     FeatureCache cache;
 
     std::vector<std::string> in0 = {};
@@ -1305,7 +1340,8 @@ int RealCUGAN::process_cpu_se_rough(const ncnn::Mat &inimage, ncnn::Mat &outimag
 }
 
 int RealCUGAN::process_cpu_se_very_rough(const ncnn::Mat &inimage, ncnn::Mat &outimage,
-                                         const std::function<void(float)> progress_listener) const {
+                                         const std::function<void(
+                                                 float)> &progress_listener) const {
     FeatureCache cache;
 
     std::vector<std::string> in0 = {};
@@ -1326,7 +1362,7 @@ int RealCUGAN::process_cpu_se_very_rough(const ncnn::Mat &inimage, ncnn::Mat &ou
 int RealCUGAN::process_se_stage0(const ncnn::Mat &inimage, const std::vector<std::string> &names,
                                  const std::vector<std::string> &outnames, const ncnn::Option &opt,
                                  FeatureCache &cache,
-                                 const std::function<void(float)> progress_listener) const {
+                                 const std::function<void(float)> &progress_listener) const {
     const unsigned char *pixeldata = (const unsigned char *) inimage.data;
     const int w = inimage.w;
     const int h = inimage.h;
@@ -1597,7 +1633,7 @@ int RealCUGAN::process_se_stage0(const ncnn::Mat &inimage, const std::vector<std
 
 int RealCUGAN::process_se_stage2(const ncnn::Mat &inimage, const std::vector<std::string> &names,
                                  ncnn::Mat &outimage, const ncnn::Option &opt, FeatureCache &cache,
-                                 const std::function<void(float)> progress_listener) const {
+                                 const std::function<void(float)> &progress_listener) const {
     const unsigned char *pixeldata = (const unsigned char *) inimage.data;
     const int w = inimage.w;
     const int h = inimage.h;
@@ -2066,7 +2102,7 @@ int RealCUGAN::process_se_stage2(const ncnn::Mat &inimage, const std::vector<std
 
 int RealCUGAN::process_se_sync_gap(const ncnn::Mat &inimage, const std::vector<std::string> &names,
                                    const ncnn::Option &opt, FeatureCache &cache,
-                                   const std::function<void(float)> progress_listener) const {
+                                   const std::function<void(float)> &progress_listener) const {
     const unsigned char *pixeldata = (const unsigned char *) inimage.data;
     const int w = inimage.w;
     const int h = inimage.h;
@@ -2190,7 +2226,7 @@ int RealCUGAN::process_se_very_rough_stage0(const ncnn::Mat &inimage,
                                             const std::vector<std::string> &outnames,
                                             const ncnn::Option &opt, FeatureCache &cache,
                                             const std::function<void(
-                                                    float)> progress_listener) const {
+                                                    float)> &progress_listener) const {
     const unsigned char *pixeldata = (const unsigned char *) inimage.data;
     const int w = inimage.w;
     const int h = inimage.h;
@@ -2463,7 +2499,7 @@ int RealCUGAN::process_se_very_rough_sync_gap(const ncnn::Mat &inimage,
                                               const std::vector<std::string> &names,
                                               const ncnn::Option &opt, FeatureCache &cache,
                                               const std::function<void(
-                                                      float)> progress_listener) const {
+                                                      float)> &progress_listener) const {
     const unsigned char *pixeldata = (const unsigned char *) inimage.data;
     const int w = inimage.w;
     const int h = inimage.h;
@@ -2601,7 +2637,7 @@ int RealCUGAN::process_se_very_rough_sync_gap(const ncnn::Mat &inimage,
 int
 RealCUGAN::process_cpu_se_stage0(const ncnn::Mat &inimage, const std::vector<std::string> &names,
                                  const std::vector<std::string> &outnames, FeatureCache &cache,
-                                 const std::function<void(float)> progress_listener) const {
+                                 const std::function<void(float)> &progress_listener) const {
     const unsigned char *pixeldata = (const unsigned char *) inimage.data;
     const int w = inimage.w;
     const int h = inimage.h;
@@ -2673,6 +2709,8 @@ RealCUGAN::process_cpu_se_stage0(const ncnn::Mat &inimage, const std::vector<std
                 // split alpha and preproc
                 ncnn::Mat in_tile[8];
                 ncnn::Mat in_alpha_tile;
+                ncnn::Mat in_alpha_tile_nocrop;
+
                 {
                     in_tile[0].create(in.w, in.h, 3);
                     for (int q = 0; q < 3; q++) {
@@ -2705,7 +2743,15 @@ RealCUGAN::process_cpu_se_stage0(const ncnn::Mat &inimage, const std::vector<std
                     ncnn::copy_make_border(in_tile[0], in_tile_padded, pad_top, pad_bottom,
                                            pad_left, pad_right, 2, 0.f, net.opt);
                     in_tile[0] = in_tile_padded;
+
+                // alpha tile cut to nopad
+                if (channels == 4) {
+                    ncnn::copy_cut_border(in_alpha_tile,
+                                          in_alpha_tile_nocrop,
+                                          pad_top, pad_bottom, pad_left, pad_right,
+                                          opt);
                 }
+}
 
                 // the other 7 directions
                 {
@@ -2779,6 +2825,7 @@ RealCUGAN::process_cpu_se_stage0(const ncnn::Mat &inimage, const std::vector<std
                 // split alpha and preproc
                 ncnn::Mat in_tile;
                 ncnn::Mat in_alpha_tile;
+                ncnn::Mat in_alpha_tile_nocrop;
                 {
                     in_tile.create(in.w, in.h, 3);
                     for (int q = 0; q < 3; q++) {
@@ -2809,6 +2856,15 @@ RealCUGAN::process_cpu_se_stage0(const ncnn::Mat &inimage, const std::vector<std
                     ncnn::copy_make_border(in_tile, in_tile_padded, pad_top, pad_bottom, pad_left,
                                            pad_right, 2, 0.f, net.opt);
                     in_tile = in_tile_padded;
+
+                    // alpha tile cut to nopad
+                    if (channels == 4) {
+                        ncnn::copy_cut_border(
+                            in_alpha_tile,
+                            in_alpha_tile_nocrop,
+                            pad_top, pad_bottom, pad_left, pad_right,
+                            opt);
+                    }
                 }
 
                 {
@@ -2840,7 +2896,7 @@ RealCUGAN::process_cpu_se_stage0(const ncnn::Mat &inimage, const std::vector<std
 int
 RealCUGAN::process_cpu_se_stage2(const ncnn::Mat &inimage, const std::vector<std::string> &names,
                                  ncnn::Mat &outimage, FeatureCache &cache,
-                                 const std::function<void(float)> progress_listener) const {
+                                 const std::function<void(float)> &progress_listener) const {
     const unsigned char *pixeldata = (const unsigned char *) inimage.data;
     const int w = inimage.w;
     const int h = inimage.h;
@@ -2912,6 +2968,8 @@ RealCUGAN::process_cpu_se_stage2(const ncnn::Mat &inimage, const std::vector<std
                 // split alpha and preproc
                 ncnn::Mat in_tile[8];
                 ncnn::Mat in_alpha_tile;
+                ncnn::Mat in_alpha_tile_nocrop;
+
                 {
                     in_tile[0].create(in.w, in.h, 3);
                     for (int q = 0; q < 3; q++) {
@@ -2944,7 +3002,15 @@ RealCUGAN::process_cpu_se_stage2(const ncnn::Mat &inimage, const std::vector<std
                     ncnn::copy_make_border(in_tile[0], in_tile_padded, pad_top, pad_bottom,
                                            pad_left, pad_right, 2, 0.f, net.opt);
                     in_tile[0] = in_tile_padded;
+
+                // alpha tile cut to nopad
+                if (channels == 4) {
+                    ncnn::copy_cut_border(in_alpha_tile,
+                                          in_alpha_tile_nocrop,
+                                          pad_top, pad_bottom, pad_left, pad_right,
+                                          opt);
                 }
+}
 
                 // the other 7 directions
                 {
@@ -3013,16 +3079,16 @@ RealCUGAN::process_cpu_se_stage2(const ncnn::Mat &inimage, const std::vector<std
                 ncnn::Mat out_alpha_tile;
                 if (channels == 4) {
                     if (scale == 1) {
-                        out_alpha_tile = in_alpha_tile;
+                        out_alpha_tile = in_alpha_tile_nocrop;
                     }
                     if (scale == 2) {
-                        bicubic_2x->forward(in_alpha_tile, out_alpha_tile, opt);
+                        bicubic_2x->forward(in_alpha_tile_nocrop, out_alpha_tile, opt);
                     }
                     if (scale == 3) {
-                        bicubic_3x->forward(in_alpha_tile, out_alpha_tile, opt);
+                        bicubic_3x->forward(in_alpha_tile_nocrop, out_alpha_tile, opt);
                     }
                     if (scale == 4) {
-                        bicubic_4x->forward(in_alpha_tile, out_alpha_tile, opt);
+                        bicubic_4x->forward(in_alpha_tile_nocrop, out_alpha_tile, opt);
                     }
                 }
 
@@ -3112,6 +3178,7 @@ RealCUGAN::process_cpu_se_stage2(const ncnn::Mat &inimage, const std::vector<std
                 // split alpha and preproc
                 ncnn::Mat in_tile;
                 ncnn::Mat in_alpha_tile;
+                ncnn::Mat in_alpha_tile_nocrop;
                 {
                     in_tile.create(in.w, in.h, 3);
                     for (int q = 0; q < 3; q++) {
@@ -3142,6 +3209,15 @@ RealCUGAN::process_cpu_se_stage2(const ncnn::Mat &inimage, const std::vector<std
                     ncnn::copy_make_border(in_tile, in_tile_padded, pad_top, pad_bottom, pad_left,
                                            pad_right, 2, 0.f, net.opt);
                     in_tile = in_tile_padded;
+
+                    // alpha tile cut to nopad
+                    if (channels == 4) {
+                        ncnn::copy_cut_border(
+                            in_alpha_tile,
+                            in_alpha_tile_nocrop,
+                            pad_top, pad_bottom, pad_left, pad_right,
+                            opt);
+                    }
                 }
 
                 // realcugan
@@ -3164,16 +3240,16 @@ RealCUGAN::process_cpu_se_stage2(const ncnn::Mat &inimage, const std::vector<std
                 ncnn::Mat out_alpha_tile;
                 if (channels == 4) {
                     if (scale == 1) {
-                        out_alpha_tile = in_alpha_tile;
+                        out_alpha_tile = in_alpha_tile_nocrop;
                     }
                     if (scale == 2) {
-                        bicubic_2x->forward(in_alpha_tile, out_alpha_tile, opt);
+                        bicubic_2x->forward(in_alpha_tile_nocrop, out_alpha_tile, opt);
                     }
                     if (scale == 3) {
-                        bicubic_3x->forward(in_alpha_tile, out_alpha_tile, opt);
+                        bicubic_3x->forward(in_alpha_tile_nocrop, out_alpha_tile, opt);
                     }
                     if (scale == 4) {
-                        bicubic_4x->forward(in_alpha_tile, out_alpha_tile, opt);
+                        bicubic_4x->forward(in_alpha_tile_nocrop, out_alpha_tile, opt);
                     }
                 }
 
@@ -3247,7 +3323,7 @@ RealCUGAN::process_cpu_se_stage2(const ncnn::Mat &inimage, const std::vector<std
 int
 RealCUGAN::process_cpu_se_sync_gap(const ncnn::Mat &inimage, const std::vector<std::string> &names,
                                    FeatureCache &cache,
-                                   const std::function<void(float)> progress_listener) const {
+                                   const std::function<void(float)> &progress_listener) const {
     const unsigned char *pixeldata = (const unsigned char *) inimage.data;
     const int w = inimage.w;
     const int h = inimage.h;
@@ -3337,7 +3413,7 @@ int RealCUGAN::process_cpu_se_very_rough_stage0(const ncnn::Mat &inimage,
                                                 const std::vector<std::string> &names,
                                                 const std::vector<std::string> &outnames,
                                                 FeatureCache &cache, const std::function<void(
-        float)> progress_listener) const {
+        float)> &progress_listener) const {
     const unsigned char *pixeldata = (const unsigned char *) inimage.data;
     const int w = inimage.w;
     const int h = inimage.h;
@@ -3409,6 +3485,8 @@ int RealCUGAN::process_cpu_se_very_rough_stage0(const ncnn::Mat &inimage,
                 // split alpha and preproc
                 ncnn::Mat in_tile[8];
                 ncnn::Mat in_alpha_tile;
+                ncnn::Mat in_alpha_tile_nocrop;
+
                 {
                     in_tile[0].create(in.w, in.h, 3);
                     for (int q = 0; q < 3; q++) {
@@ -3441,7 +3519,15 @@ int RealCUGAN::process_cpu_se_very_rough_stage0(const ncnn::Mat &inimage,
                     ncnn::copy_make_border(in_tile[0], in_tile_padded, pad_top, pad_bottom,
                                            pad_left, pad_right, 2, 0.f, net.opt);
                     in_tile[0] = in_tile_padded;
+
+                // alpha tile cut to nopad
+                if (channels == 4) {
+                    ncnn::copy_cut_border(in_alpha_tile,
+                                          in_alpha_tile_nocrop,
+                                          pad_top, pad_bottom, pad_left, pad_right,
+                                          opt);
                 }
+}
 
                 // the other 7 directions
                 {
@@ -3515,6 +3601,7 @@ int RealCUGAN::process_cpu_se_very_rough_stage0(const ncnn::Mat &inimage,
                 // split alpha and preproc
                 ncnn::Mat in_tile;
                 ncnn::Mat in_alpha_tile;
+                ncnn::Mat in_alpha_tile_nocrop;
                 {
                     in_tile.create(in.w, in.h, 3);
                     for (int q = 0; q < 3; q++) {
@@ -3545,7 +3632,15 @@ int RealCUGAN::process_cpu_se_very_rough_stage0(const ncnn::Mat &inimage,
                     ncnn::copy_make_border(in_tile, in_tile_padded, pad_top, pad_bottom, pad_left,
                                            pad_right, 2, 0.f, net.opt);
                     in_tile = in_tile_padded;
+
+                // alpha tile cut to nopad
+                if (channels == 4) {
+                    ncnn::copy_cut_border(in_alpha_tile,
+                                          in_alpha_tile_nocrop,
+                                          pad_top, pad_bottom, pad_left, pad_right,
+                                          opt);
                 }
+}
 
                 {
                     ncnn::Extractor ex = net.create_extractor();
@@ -3678,8 +3773,8 @@ int RealCUGAN::process_cpu_se_very_rough_sync_gap(const ncnn::Mat &inimage,
     return 0;
 }
 
- void RealCUGAN::report_progress(int xtiles, int ytiles, int yi, int xi,
-                                const std::function<void(float)>& on_progress) {
+void RealCUGAN::report_progress(int xtiles, int ytiles, int yi, int xi,
+                                const std::function<void(float)> &on_progress) {
     const int total_tiles = xtiles * ytiles;
     const int done = yi * xtiles + xi + 1;
     const float percent = (static_cast<float>(done) * 100.f) / (float) total_tiles;

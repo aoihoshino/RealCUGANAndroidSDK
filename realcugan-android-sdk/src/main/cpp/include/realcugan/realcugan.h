@@ -27,75 +27,75 @@ public:
 #endif
 
     int process(const ncnn::Mat &inimage, ncnn::Mat &outimage,
-                const std::function<void(float)> progress_listener) const;
+                const std::function<void(float)> &progress_listener) const;
 
     int process_cpu(const ncnn::Mat &inimage, ncnn::Mat &outimage,
-                    const std::function<void(float)> progress_listener) const;
+                    const std::function<void(float)> &progress_listener) const;
 
     int process_se(const ncnn::Mat &inimage, ncnn::Mat &outimage,
-                   const std::function<void(float)> progress_listener) const;
+                   const std::function<void(float)> &progress_listener) const;
 
     int process_cpu_se(const ncnn::Mat &inimage, ncnn::Mat &outimage,
-                       const std::function<void(float)> progress_listener) const;
+                       const std::function<void(float)> &progress_listener) const;
 
     int process_se_rough(const ncnn::Mat &inimage, ncnn::Mat &outimage,
-                         const std::function<void(float)> progress_listener) const;
+                         const std::function<void(float)> &progress_listener) const;
 
     int process_cpu_se_rough(const ncnn::Mat &inimage, ncnn::Mat &outimage,
-                             const std::function<void(float)> progress_listener) const;
+                             const std::function<void(float)> &progress_listener) const;
 
     int process_se_very_rough(const ncnn::Mat &inimage, ncnn::Mat &outimage,
-                              const std::function<void(float)> progress_listener) const;
+                              const std::function<void(float)> &progress_listener) const;
 
     int process_cpu_se_very_rough(const ncnn::Mat &inimage, ncnn::Mat &outimage,
-                                  const std::function<void(float)> progress_listener) const;
+                                  const std::function<void(float)> &progress_listener) const;
 
 protected:
     int process_se_stage0(const ncnn::Mat &inimage, const std::vector<std::string> &names,
                           const std::vector<std::string> &outnames, const ncnn::Option &opt,
                           FeatureCache &cache,
-                          const std::function<void(float)> progress_listener) const;
+                          const std::function<void(float)> &progress_listener) const;
 
     int process_se_stage2(const ncnn::Mat &inimage, const std::vector<std::string> &names,
                           ncnn::Mat &outimage, const ncnn::Option &opt, FeatureCache &cache,
-                          const std::function<void(float)> progress_listener) const;
+                          const std::function<void(float)> &progress_listener) const;
 
     int process_se_sync_gap(const ncnn::Mat &inimage, const std::vector<std::string> &names,
                             const ncnn::Option &opt, FeatureCache &cache,
-                            const std::function<void(float)> progress_listener) const;
+                            const std::function<void(float)> &progress_listener) const;
 
     int
     process_se_very_rough_stage0(const ncnn::Mat &inimage, const std::vector<std::string> &names,
                                  const std::vector<std::string> &outnames, const ncnn::Option &opt,
                                  FeatureCache &cache,
-                                 const std::function<void(float)> progress_listener) const;
+                                 const std::function<void(float)> &progress_listener) const;
 
     int
     process_se_very_rough_sync_gap(const ncnn::Mat &inimage, const std::vector<std::string> &names,
                                    const ncnn::Option &opt, FeatureCache &cache,
-                                   const std::function<void(float)> progress_listener) const;
+                                   const std::function<void(float)> &progress_listener) const;
 
     int process_cpu_se_stage0(const ncnn::Mat &inimage, const std::vector<std::string> &names,
                               const std::vector<std::string> &outnames, FeatureCache &cache,
-                              const std::function<void(float)> progress_listener) const;
+                              const std::function<void(float)> &progress_listener) const;
 
     int process_cpu_se_stage2(const ncnn::Mat &inimage, const std::vector<std::string> &names,
                               ncnn::Mat &outimage, FeatureCache &cache,
-                              const std::function<void(float)> progress_listener) const;
+                              const std::function<void(float)> &progress_listener) const;
 
     int process_cpu_se_sync_gap(const ncnn::Mat &inimage, const std::vector<std::string> &names,
                                 FeatureCache &cache,
-                                const std::function<void(float)> progress_listener) const;
+                                const std::function<void(float)> &progress_listener) const;
 
     int process_cpu_se_very_rough_stage0(const ncnn::Mat &inimage,
                                          const std::vector<std::string> &names,
                                          const std::vector<std::string> &outnames,
                                          FeatureCache &cache,
-                                         const std::function<void(float)> progress_listener) const;
+                                         const std::function<void(float)> &progress_listener) const;
 
     int process_cpu_se_very_rough_sync_gap(const ncnn::Mat &inimage,
                                            const std::vector<std::string> &names,
-                                           FeatureCache &cache, const std::function<void(
+                                           FeatureCache &cache, std::function<void(
             float)> progress_listener) const;
 
 public:
@@ -117,7 +117,7 @@ private:
     ncnn::Layer *bicubic_4x;
 
     static void report_progress(int xtiles, int ytiles, int yi, int xi,
-                         const std::function<void(float)>& on_progress) ;
+                                const std::function<void(float)> &on_progress);
 
     bool tta_mode;
 };
