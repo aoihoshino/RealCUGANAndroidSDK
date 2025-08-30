@@ -1,6 +1,7 @@
 package io.github.aoihoshino.realcugan_ncnn_android
 
 import RealCUGANOption
+import ModelName
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -30,8 +31,26 @@ class MainActivity : AppCompatActivity() {
     private var lastProgress: Float = -1f
     private var lastProgressAt: Long = 0L
 
+    // 选项覆盖集合（根据 RealCUGANOption 说明）：
+    // - modelName 决定合法的 scale / noise 取值
+    // - syncgap 仅允许 0..3
+    // - gpuId 可为 null（按库默认），或 >= -1（-1 为 CPU）
+    private val models = listOf(ModelName.NOSE, ModelName.PRO, ModelName.SE)
+    private val syncgaps = listOf(0, 3)               // 可改为 listOf(0,1,2,3) 做更细覆盖
+    private val gpuIds: List<Int?> = listOf(null)     // 如需 CPU/GPU 覆盖，设为 listOf(-1, 0)
+
+    private data class Case(
+        val name: String,
+        val model: ModelName,
+        val noise: Int,
+        val scale: Int,
+        val syncgap: Int,
+        val tta: Boolean,
+        val gpuId: Int?
+    )
+
     // 待测 scale 列表（可以根据需要调）
-    private val scales = listOf(4)
+    private val scales = listOf(4) // 如需更多覆盖：listOf(2, 3, 4)
     private val testFiles = listOf(
         "test1.png",
         "test2.jpeg",
@@ -80,26 +99,70 @@ class MainActivity : AppCompatActivity() {
         // 通过 Service 处理：等待 Binder → 初始化 → 逐个处理
         lifecycleScope.launch(Dispatchers.IO) {
             val b = binderReady.await()
-            // 仅初始化一次（示例：使用第一个 scale）
-            b.init(
-                RealCUGANOption(
-                    context = applicationContext, // 一定用 ApplicationContext
-                    scale = scales.first(),
-                    gpuId = -1,
-                )
-            )
 
-            val timeCost = measureTime {
-                for (filename in testFiles) {
-                    val bytes = assets.open(filename).use { it.readBytes() }
-                    val bmp = awaitProcess(b, bytes, filename)
-                    withContext(Dispatchers.Main) {
-                        imageView.setImageBitmap(bmp)
+            // 组合测试用例：按模型约束枚举合法 (model × noise × scale × syncgap × tta × gpuId)
+            val cases = buildList {
+                for (m in models) {
+                    for (n in m.allowedNoises) {
+                        for (s in m.allowedScales) {
+                            for (sg in syncgaps) {
+                                for (gid in gpuIds) {
+                                    add(
+                                        Case(
+                                            name = "${m.name}-n${n}-x${s}-sg${sg}-ttaF ${if (gid == null) "" else "-gpu$gid"}",
+                                            model = m,
+                                            noise = n,
+                                            scale = s,
+                                            syncgap = sg,
+                                            tta = false, // tta开启会更费时
+                                            gpuId = gid
+                                        )
+                                    )
+                                }
+                            }
+                        }
                     }
-                    Log.i(TAG, "Processed $filename → ${bmp.width}×${bmp.height}")
                 }
             }
-            Log.i(TAG, "Processed all jobs in $timeCost")
+
+            val totalCost = measureTime {
+                for (case in cases) {
+                    // 每个用例单独初始化（确保 native 参数生效）
+                    b.init(
+                        RealCUGANOption(
+                            context = applicationContext,
+                            noise = case.noise,
+                            scale = case.scale,
+                            syncgap = case.syncgap,
+                            modelName = case.model,
+                            ttaMode = case.tta,
+                            gpuId = case.gpuId
+                        )
+                    )
+
+                    Log.i(TAG, "==== Begin Case: ${case.name} ==== ")
+
+                    val caseCost = measureTime {
+                        for (filename in testFiles) {
+                            // 重置节流进度，避免跨任务沿用
+                            lastProgress = -1f
+                            lastProgressAt = 0L
+
+                            val bytes = assets.open(filename).use { it.readBytes() }
+                            val displayName = "${case.name}::$filename"
+                            val bmp = awaitProcess(b, bytes, displayName)
+
+                            withContext(Dispatchers.Main) {
+                                imageView.setImageBitmap(bmp)
+                            }
+                            Log.i(TAG, "Processed ${displayName} → ${bmp.width}×${bmp.height}")
+                        }
+                    }
+
+                    Log.i(TAG, "==== End Case: ${case.name}, cost=${caseCost} ====")
+                }
+            }
+            Log.i(TAG, "Processed all cases in $totalCost")
         }
     }
 
@@ -118,7 +181,7 @@ class MainActivity : AppCompatActivity() {
                     if (p - lastProgress >= 1f || now - lastProgressAt >= 200) {
                         lastProgress = p
                         lastProgressAt = now
-                        Log.i(TAG, "$displayName Processing ${p}%")
+                        Log.i(TAG, String.format("%s Processing %.2f%%", displayName, p))
                     }
                 }
             }
