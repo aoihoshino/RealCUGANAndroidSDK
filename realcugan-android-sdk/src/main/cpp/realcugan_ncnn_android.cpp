@@ -146,6 +146,18 @@ RealCUGAN *find_realcugan(jlong handle) {
     return inst;
 }
 
+static long read_memavailable_kb() {
+    FILE* f = fopen("/proc/meminfo", "r");
+    if (!f) return -1;
+    char line[256];
+    long kb = -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "MemAvailable: %ld kB", &kb) == 1) break;
+    }
+    fclose(f);
+    return kb; // -1 表示失败
+}
+
 extern "C" JNIEXPORT jlong JNICALL
 Java_io_github_aoihoshino_realcugan_1ncnn_1android_RealCUGAN_nativeInitialize(
         JNIEnv *env, jclass /* this */,
@@ -274,10 +286,12 @@ Java_io_github_aoihoshino_realcugan_1ncnn_1android_RealCUGAN_nativeInitialize(
         bool isQualcomm = props.vendor_id() == 0x5143
                           || std::string(props.device_name()).find("Adreno") != std::string::npos;
         if (isQualcomm) {
-            // … 前面初始化 VulkanDevice vkdev …
+            // Qualcomm / Adreno 常见为 UMA，共享系统内存；优先使用 VK_EXT_memory_budget，
+            // 否则回退到 /proc/meminfo 的 MemAvailable 做动态预算，再退到总内存估算。
             float heapMB = 0.f;
-            if (props.support_VK_EXT_memory_priority() && props.support_VK_EXT_memory_budget()) {
-                // 使用扩展取真实预算
+
+            if (props.support_VK_EXT_memory_budget()) {
+                // 设备提供 memory_budget：直接使用预算（单位：MB）
                 VkPhysicalDeviceMemoryProperties2 mem2{
                         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
                 VkPhysicalDeviceMemoryBudgetPropertiesEXT bud{
@@ -285,20 +299,52 @@ Java_io_github_aoihoshino_realcugan_1ncnn_1android_RealCUGAN_nativeInitialize(
                 mem2.pNext = &bud;
                 ncnn::vkGetPhysicalDeviceMemoryProperties(props.physical_device(),
                                                           &mem2.memoryProperties);
-                heapMB = bud.heapBudget[0] / float(1024 * 1024);
+                heapMB = bud.heapBudget[0] / (1024.0f * 1024.0f);
             } else {
-                // Fallback：用总显存的 80%
-                VkPhysicalDeviceMemoryProperties mp{};
-                ncnn::vkGetPhysicalDeviceMemoryProperties(props.physical_device(), &mp);
-                for (uint32_t i = 0; i < mp.memoryHeapCount; i++) {
-                    if (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
-                        heapMB = (mp.memoryHeaps[i].size * 0.8f) / float(1024 * 1024 * 8);
-                        break;
+                // Fallback A1：系统可用内存的部分比例作为“活动峰值”预算
+                long avail_kb = read_memavailable_kb();
+                if (avail_kb > 0) {
+                    const float take_ratio = 0.30f; // 前台建议 0.25~0.33，可按场景调参
+                    heapMB = (avail_kb * take_ratio) / 1024.0f;
+                }
+
+                // Fallback A2：退回到总物理内存比例
+                if (heapMB <= 0.f) {
+                    long pages = sysconf(_SC_PHYS_PAGES);
+                    long page_size = sysconf(_SC_PAGE_SIZE);
+                    if (pages > 0 && page_size > 0) {
+                        float totalMB = (pages * (page_size / 1024.0f)) / 1024.0f;
+                        heapMB = totalMB * 0.33f; // 约取 1/3 作为活动上限
                     }
                 }
+
+                // Fallback A3：仍取不到，给出保守常量
+                if (heapMB <= 0.f) heapMB = 100.f;
             }
-            heap = heapMB;
-            tilesize = (int) (heap / scale);
+
+            // 将 heapMB→tilesize（按现有经验阈值，单位：MB）
+            if (scale == 2) {
+                if (heapMB > 1300) tilesize = 400;
+                else if (heapMB > 800) tilesize = 300;
+                else if (heapMB > 400) tilesize = 200;
+                else if (heapMB > 200) tilesize = 100;
+                else tilesize = 32;
+            } else if (scale == 3) {
+                if (heapMB > 3300) tilesize = 400;
+                else if (heapMB > 1900) tilesize = 300;
+                else if (heapMB > 950)  tilesize = 200;
+                else if (heapMB > 320)  tilesize = 100;
+                else tilesize = 32;
+            } else { // scale == 4
+                if (heapMB > 1690) tilesize = 400;
+                else if (heapMB > 980)  tilesize = 300;
+                else if (heapMB > 530)  tilesize = 200;
+                else if (heapMB > 240)  tilesize = 100;
+                else tilesize = 32;
+            }
+
+            heap = static_cast<uint32_t>(heapMB);
+            LOGI("Qualcomm budget: heapMB=%.1fMB -> tilesize=%d (scale=%d)", heapMB, tilesize, scale);
         } else {
             heap = vkdev->get_heap_budget();
             if (scale == 2) {
@@ -321,7 +367,6 @@ Java_io_github_aoihoshino_realcugan_1ncnn_1android_RealCUGAN_nativeInitialize(
                 else tilesize = 32;
             }
         }
-        LOGI("heap=%u", heap);
     }
 
 
