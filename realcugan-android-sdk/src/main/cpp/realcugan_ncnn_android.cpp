@@ -615,13 +615,33 @@ Java_io_github_aoihoshino_realcugan_1ncnn_1android_RealCUGAN_nativeProcessBitmap
 extern "C" JNIEXPORT void JNICALL
 Java_io_github_aoihoshino_realcugan_1ncnn_1android_RealCUGAN_nativeRelease(
         JNIEnv * /*env*/, jclass, jlong handle) {
-    std::lock_guard<std::mutex> lk(g_cache_mutex);
-    for (auto it = g_cache.begin(); it != g_cache.end(); ++it) {
-        if (it->second.handle == handle) {
-            delete it->second.inst;
-            g_cache.erase(it);
-            release_ncnn_gpu();
-            break;
+    // 先从缓存安全移除，再在锁外 delete，避免析构里间接拿锁/阻塞造成 ANR
+    RealCUGAN *victim = nullptr;
+    bool shouldDestroyGpu = false;
+    {
+        std::lock_guard<std::mutex> lk(g_cache_mutex);
+        for (auto it = g_cache.begin(); it != g_cache.end(); ++it) {
+            if (it->second.handle == handle) {
+                victim = it->second.inst;
+                g_cache.erase(it);
+                shouldDestroyGpu = g_cache.empty();
+                break;
+            }
         }
     }
+
+    // 在不持有 g_cache_mutex 的情况下释放实例
+    delete victim;
+
+
+    // 如已无实例，按固定锁顺序(gpu_mutex)销毁 GPU 以避免死锁
+    if (shouldDestroyGpu) {
+        std::lock_guard<std::mutex> lg(gpu_mutex);
+        if (gpu_initialized) {
+            ncnn::destroy_gpu_instance();
+            gpu_initialized = false;
+        }
+    }
+
+    LOGI("nativeRelease: handle=%ld", (long) handle);
 }
