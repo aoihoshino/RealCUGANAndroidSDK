@@ -19,6 +19,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.coroutineScope
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.time.measureTime
@@ -30,6 +31,7 @@ class MainActivity : AppCompatActivity() {
 
     private var lastProgress: Float = -1f
     private var lastProgressAt: Long = 0L
+    private lateinit var imageView: ImageView
 
     // 选项覆盖集合（根据 RealCUGANOption 说明）：
     // - modelName 决定合法的 scale / noise 取值
@@ -57,6 +59,12 @@ class MainActivity : AppCompatActivity() {
         "test3.png"
     )
 
+    // —— 并发测试用配置（可按需调整） ——
+    private val serviceMaxConcurrent: Int = 2   // Service 侧最大并发许可数（Semaphore）
+    private val queueEnabled: Boolean = true    // true=排队，false=满额即失败
+    private val concurrentClients: Int = 4      // 并发提交的协程数量
+    private val loopsPerClient: Int = 2         // 每个协程重复处理轮数
+
     // Service Binder 相关
     private var binder: RealCUGANService.LocalBinder? = null
     private val binderReady = CompletableDeferred<RealCUGANService.LocalBinder>()
@@ -80,7 +88,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-        val imageView = findViewById<ImageView>(R.id.resultImageView)
+        imageView = findViewById<ImageView>(R.id.resultImageView)
 
         // —— 启动与绑定 Service（外部可控制是否显示前台通知）——
         val svcIntent = Intent(this, RealCUGANService::class.java)
@@ -100,31 +108,22 @@ class MainActivity : AppCompatActivity() {
         lifecycleScope.launch(Dispatchers.IO) {
             val b = binderReady.await()
 
-            // 组合测试用例：按模型约束枚举合法 (model × noise × scale × syncgap × tta × gpuId)
-            val cases = buildList {
-                for (m in models) {
-                    for (n in m.allowedNoises) {
-                        for (s in m.allowedScales) {
-                            for (sg in syncgaps) {
-                                for (gid in gpuIds) {
-                                    add(
-                                        Case(
-                                            name = "${m.name}-n${n}-x${s}-sg${sg}-ttaF ${if (gid == null) "" else "-gpu$gid"}",
-                                            model = m,
-                                            noise = n,
-                                            scale = s,
-                                            syncgap = sg,
-                                            tta = false, // tta开启会更费时
-                                            gpuId = gid
-                                        )
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // 配置 Service 并发闸
+            b.configureConcurrency(max = serviceMaxConcurrent, queue = queueEnabled)
 
+            // 基础测试用例：单一默认 Case
+            val cases = listOf(
+                Case(
+                    name = "basic",
+                    model = ModelName.SE,
+                    noise = -1,
+                    scale = 2,
+                    syncgap = 3,
+                    tta = false,
+                    gpuId = null
+                )
+            )
+            val totalImages = concurrentClients * loopsPerClient * testFiles.size * cases.size
             val totalCost = measureTime {
                 for (case in cases) {
                     // 每个用例单独初始化（确保 native 参数生效）
@@ -140,29 +139,57 @@ class MainActivity : AppCompatActivity() {
                         )
                     )
 
-                    Log.i(TAG, "==== Begin Case: ${case.name} ==== ")
+                    Log.i(
+                        TAG,
+                        "==== Begin Concurrency Case: ${case.name} | clients=$concurrentClients loops=$loopsPerClient svcMax=$serviceMaxConcurrent queue=$queueEnabled ===="
+                    )
 
                     val caseCost = measureTime {
-                        for (filename in testFiles) {
-                            // 重置节流进度，避免跨任务沿用
-                            lastProgress = -1f
-                            lastProgressAt = 0L
+                        coroutineScope {
+                            repeat(concurrentClients) { clientIdx ->
+                                launch(Dispatchers.IO) {
+                                    repeat(loopsPerClient) { loopIdx ->
+                                        for (filename in testFiles) {
+                                            // 重置节流进度，避免跨任务沿用
+                                            lastProgress = -1f
+                                            lastProgressAt = 0L
 
-                            val bytes = assets.open(filename).use { it.readBytes() }
-                            val displayName = "${case.name}::$filename"
-                            val bmp = awaitProcess(b, bytes, displayName)
-
-                            withContext(Dispatchers.Main) {
-                                imageView.setImageBitmap(bmp)
+                                            val bytes = assets.open(filename).use { it.readBytes() }
+                                            val displayName =
+                                                "${case.name}::C$clientIdx-L$loopIdx::$filename"
+                                            try {
+                                                val bmp = awaitProcess(b, bytes, displayName)
+                                                // 为降低 UI 干扰，这里不必每次都刷新到 ImageView；如需观察可以放开以下代码：
+                                                // withContext(Dispatchers.Main) { imageView.setImageBitmap(bmp) }
+                                                Log.i(
+                                                    TAG,
+                                                    "OK ${displayName} → ${bmp.width}×${bmp.height}"
+                                                )
+                                            } catch (t: Throwable) {
+                                                Log.e(TAG, "FAIL ${displayName}: ${t.message}")
+                                            }
+                                        }
+                                    }
+                                }
                             }
-                            Log.i(TAG, "Processed ${displayName} → ${bmp.width}×${bmp.height}")
                         }
                     }
 
                     Log.i(TAG, "==== End Case: ${case.name}, cost=${caseCost} ====")
                 }
             }
-            Log.i(TAG, "Processed all cases in $totalCost")
+            Log.i(TAG, "==== Concurrency Test Done: images=$totalImages, total=$totalCost ====")
+
+            // —— 测试完成：回收 Service ——
+            try {
+                withContext(Dispatchers.Main) {
+                    binder?.dispose() // 调用 Service 提供的释放方法（需在 LocalBinder 实现）
+                    unbindService(conn)
+                    stopService(Intent(this@MainActivity, RealCUGANService::class.java))
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "Error stopping service: ${t.message}")
+            }
         }
     }
 
@@ -174,7 +201,7 @@ class MainActivity : AppCompatActivity() {
         val taskId = b.process(
             imageData = bytes,
             displayName = displayName,
-            listener = ProgressListener { p ->
+            listener = { p ->
                 // 在主线程打印/更新（节流：每提升≥1%或间隔≥200ms再更新一次）
                 lifecycleScope.launch(Dispatchers.Main) {
                     val now = System.currentTimeMillis()
@@ -187,7 +214,12 @@ class MainActivity : AppCompatActivity() {
             }
         ) { result ->
             result.onSuccess { bmp ->
-                if (cont.isActive) cont.resume(bmp)
+                if (cont.isActive) {
+                    runOnUiThread {
+                        imageView.setImageBitmap(bmp)
+                    }
+                    cont.resume(bmp)
+                }
             }.onFailure { t ->
                 if (cont.isActive) cont.resumeWithException(t)
             }
