@@ -1,7 +1,5 @@
-package io.github.aoihoshino.realcugan_ncnn_android
+package io.github.aoihoshino.realcugan_android_sdk
 
-import RealCUGANOption
-import ModelName
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -14,6 +12,7 @@ import android.widget.ImageView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import io.github.aoihoshino.realcugan_android_sdk.R
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch

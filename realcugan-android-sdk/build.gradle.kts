@@ -1,3 +1,5 @@
+import com.android.build.api.dsl.LibraryExtension
+
 plugins {
     alias(libs.plugins.android.library)
     alias(libs.plugins.kotlin.android)
@@ -5,11 +7,11 @@ plugins {
 }
 
 group = "io.github.aoihoshino"
-version = "1.1"
+version = "1.5"
 
-android {
-    namespace = "io.github.aoihoshino.realcugan_ncnn_android"
-    compileSdk = 36
+configure<LibraryExtension> {
+    namespace = "io.github.aoihoshino.realcugan_android_sdk"
+    compileSdk = 37
 
     defaultConfig {
         minSdk = 24
@@ -18,13 +20,13 @@ android {
         consumerProguardFiles("consumer-rules.pro")
         externalNativeBuild {
             cmake {
-                arguments += listOf(
+                arguments(
                     "-DANDROID_TOOLCHAIN=clang",
                     "-DANDROID_STL=c++_static",
-                    "-DCMAKE_BUILD_TYPE=Debug",    // 确保是 Debug 模式
+                    "-DCMAKE_BUILD_TYPE=Debug",
                     "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"
                 )
-                cppFlags += listOf("-g")
+                cppFlags("-g")
             }
         }
 
@@ -63,14 +65,19 @@ android {
         targetCompatibility = JavaVersion.VERSION_11
     }
 
-    kotlin {
-        compilerOptions {
-            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_11)
+    publishing {
+        singleVariant("release") {
+            withSourcesJar()
         }
     }
 }
 
-val mockitoAgent = configurations.create("mockitoAgent")
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_11)
+    }
+}
+
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)
@@ -82,16 +89,14 @@ dependencies {
 }
 
 afterEvaluate {
-    // 确保 android 扩展已经配置完毕
-    android.libraryVariants.forEach { variant ->
-        // 用 Kotlin 泛型方式创建 Publication
-        publishing.publications.create<MavenPublication>(variant.name) {
-            // 从对应的组件打包
-            from(components.getByName(variant.name))
-            // 三个属性直接赋值（确保 project.groupId、project.artifactId 在上面已声明）
-            groupId = project.group.toString()
-            artifactId = "realcugan-android-sdk"
-            version = project.version.toString()
+    publishing {
+        publications {
+            create<MavenPublication>("release") {
+                from(components["release"])
+                groupId = project.group.toString()
+                artifactId = "realcugan-android-sdk"
+                version = project.version.toString()
+            }
         }
     }
 }

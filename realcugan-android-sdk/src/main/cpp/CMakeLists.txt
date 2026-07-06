@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22.1)
-project("realcugan_ncnn_android")
+project("realcugan_android_sdk")
 
 # 支持的 ABI 列表
 set(ANDROID_ABIS armeabi-v7a arm64-v8a riscv64 x86 x86_64)
@@ -48,7 +48,7 @@ endif()
 
 # 生成主共享库
 add_library(${PROJECT_NAME} SHARED
-        realcugan_ncnn_android.cpp
+        realcugan_android_sdk.cpp
         realcugan.cpp
 )
 

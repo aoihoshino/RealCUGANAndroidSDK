@@ -1,3 +1,5 @@
+package io.github.aoihoshino.realcugan_android_sdk
+
 import android.content.Context
 
 /** 对应 assets/models 下的目录名，并维护了每个模型允许的 scale/noise */

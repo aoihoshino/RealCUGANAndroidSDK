@@ -1,16 +1,18 @@
+import com.android.build.api.dsl.ApplicationExtension
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
 }
 
-android {
-    namespace = "io.github.aoihoshino.realcugan_ncnn_android"
-    compileSdk = 36
+configure<ApplicationExtension> {
+    namespace = "io.github.aoihoshino.realcugan_android_sdk"
+    compileSdk = 37
 
     defaultConfig {
-        applicationId = "io.github.aoihoshino.realcugan_ncnn_android"
+        applicationId = "io.github.aoihoshino.realcugan_android_sdk"
         minSdk = 24
-        targetSdk = 36
+        targetSdk = 37
         versionCode = 1
         versionName = "1.0"
 
@@ -24,13 +26,9 @@ android {
         externalNativeBuild {
             cmake {
                 // 传给 CMake 的参数列表
-                arguments += listOf(
-                    "-DANDROID_TOOLCHAIN=clang",
-                    "-DANDROID_STL=c++_static",
-                    "-DCMAKE_BUILD_TYPE=Debug"    // 确保是 Debug 模式
-                )
+                arguments("-DANDROID_TOOLCHAIN=clang", "-DANDROID_STL=c++_static", "-DCMAKE_BUILD_TYPE=Debug")
                 // 额外的编译标志（-g 开启调试符号）
-                cppFlags += listOf("-g")
+                cppFlags("-g")
             }
         }
     }
@@ -60,14 +58,14 @@ android {
         targetCompatibility = JavaVersion.VERSION_11
     }
 
-    kotlin {
-        compilerOptions {
-            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_11)
-        }
-    }
-
     buildFeatures {
         viewBinding = true
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_11)
     }
 }
 

@@ -1,6 +1,5 @@
-package io.github.aoihoshino.realcugan_ncnn_android
+package io.github.aoihoshino.realcugan_android_sdk
 
-import RealCUGANOption
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -99,7 +98,7 @@ class RealCUGAN private constructor(
          */
         suspend fun create(realCUGANOption: RealCUGANOption): RealCUGAN =
             withContext(Dispatchers.Default) {
-                System.loadLibrary("realcugan_ncnn_android")
+                System.loadLibrary("realcugan_android_sdk")
                 val destRoot = copyModels(context = realCUGANOption.context)
                 val handle = nativeInitialize(
                     destRoot.absolutePath,

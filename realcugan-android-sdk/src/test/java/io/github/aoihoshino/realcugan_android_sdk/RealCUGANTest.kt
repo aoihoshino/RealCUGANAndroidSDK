@@ -1,7 +1,5 @@
-package io.github.aoihoshino.realcugan_ncnn_android
+package io.github.aoihoshino.realcugan_android_sdk
 
-import ModelName
-import RealCUGANOption
 import android.content.Context
 import android.content.res.AssetManager
 import kotlinx.coroutines.runBlocking

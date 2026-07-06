@@ -15,7 +15,7 @@
 #include <thread>
 #include <algorithm>
 
-#define LOG_TAG "RealCUGAN_NCNN_ANDROID_NATIVE"
+#define LOG_TAG "RealCUGAN_ANDROID_SDK_NATIVE"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 
@@ -161,7 +161,7 @@ static long read_memavailable_kb() {
 }
 
 extern "C" JNIEXPORT jlong JNICALL
-Java_io_github_aoihoshino_realcugan_1ncnn_1android_RealCUGAN_nativeInitialize(
+Java_io_github_aoihoshino_realcugan_1android_1sdk_RealCUGAN_nativeInitialize(
         JNIEnv *env, jclass /* this */,
         jstring modelRootDir,
         jobject noiseObj,
@@ -465,7 +465,7 @@ static void unlockBitmap(JNIEnv *env, jobject bitmap) {
 
 // ---------- Preferred path: Bitmap -> ncnn::Mat -> Bitmap ----------
 extern "C" JNIEXPORT jboolean JNICALL
-Java_io_github_aoihoshino_realcugan_1ncnn_1android_RealCUGAN_nativeProcessBitmap(
+Java_io_github_aoihoshino_realcugan_1android_1sdk_RealCUGAN_nativeProcessBitmap(
         JNIEnv *env, jclass /*clazz*/,
         jlong handle,
         jobject inBitmap,   // ARGB_8888, mutable, SOFTWARE

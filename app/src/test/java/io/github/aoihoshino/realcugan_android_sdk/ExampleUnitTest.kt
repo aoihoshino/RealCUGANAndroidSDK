@@ -1,4 +1,4 @@
-package io.github.aoihoshino.realcugan_ncnn_android
+package io.github.aoihoshino.realcugan_android_sdk
 
 import org.junit.Test
 

@@ -1,6 +1,5 @@
-package io.github.aoihoshino.realcugan_ncnn_android
+package io.github.aoihoshino.realcugan_android_sdk
 
-import RealCUGANOption
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -11,6 +10,7 @@ import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import io.github.aoihoshino.realcugan_android_sdk.R
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
