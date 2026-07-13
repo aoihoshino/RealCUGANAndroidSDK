@@ -613,7 +613,7 @@ Java_io_github_aoihoshino_realcugan_1android_1sdk_RealCUGAN_nativeProcessBitmap(
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_io_github_aoihoshino_realcugan_1ncnn_1android_RealCUGAN_nativeRelease(
+Java_io_github_aoihoshino_realcugan_1android_1sdk_RealCUGAN_nativeRelease(
         JNIEnv * /*env*/, jclass, jlong handle) {
     // 先从缓存安全移除，再在锁外 delete，避免析构里间接拿锁/阻塞造成 ANR
     RealCUGAN *victim = nullptr;

@@ -7,7 +7,7 @@ plugins {
 }
 
 group = "io.github.aoihoshino"
-version = "1.5"
+version = "1.6"
 
 configure<LibraryExtension> {
     namespace = "io.github.aoihoshino.realcugan_android_sdk"
