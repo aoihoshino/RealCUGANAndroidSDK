@@ -3,6 +3,7 @@
 #ifndef REALCUGAN_H
 #define REALCUGAN_H
 
+#include <atomic>
 #include <string>
 
 // ncnn
@@ -49,6 +50,18 @@ public:
 
     int process_cpu_se_very_rough(const ncnn::Mat &inimage, ncnn::Mat &outimage,
                                   const std::function<void(float)> &progress_listener) const;
+
+    void cancel();
+
+    void reset_cancel();
+
+    bool is_cancelled() const;
+
+    void begin_process();
+
+    void end_process();
+
+    int active_process_count() const;
 
 protected:
     int process_se_stage0(const ncnn::Mat &inimage, const std::vector<std::string> &names,
@@ -115,6 +128,8 @@ private:
     ncnn::Layer *bicubic_2x;
     ncnn::Layer *bicubic_3x;
     ncnn::Layer *bicubic_4x;
+    mutable std::atomic_bool cancelled;
+    mutable std::atomic_int active_processes;
 
     static void report_progress(int xtiles, int ytiles, int yi, int xi,
                                 const std::function<void(float)> &on_progress);

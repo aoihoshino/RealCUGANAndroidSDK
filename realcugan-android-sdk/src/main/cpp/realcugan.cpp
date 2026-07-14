@@ -11,9 +11,13 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
+#define REALCUGAN_CANCELLED -2
+#define RETURN_IF_CANCELLED() do { if (is_cancelled()) return REALCUGAN_CANCELLED; } while (0)
+
 
 // ncnn
 #include "cpu.h"
+#include "allocator.h"
 
 #include "realcugan_preproc.comp.hex.h"
 #include "realcugan_postproc.comp.hex.h"
@@ -66,6 +70,8 @@ RealCUGAN::RealCUGAN(int gpuid, bool _tta_mode, int num_threads) {
     bicubic_2x = 0;
     bicubic_3x = 0;
     bicubic_4x = 0;
+    cancelled.store(false, std::memory_order_relaxed);
+    active_processes.store(0, std::memory_order_relaxed);
     tta_mode = _tta_mode;
 }
 
@@ -86,6 +92,32 @@ RealCUGAN::~RealCUGAN() {
     delete bicubic_4x;
 }
 
+void RealCUGAN::cancel() {
+    cancelled.store(true, std::memory_order_relaxed);
+}
+
+void RealCUGAN::reset_cancel() {
+    cancelled.store(false, std::memory_order_relaxed);
+}
+
+bool RealCUGAN::is_cancelled() const {
+    return cancelled.load(std::memory_order_relaxed);
+}
+
+void RealCUGAN::begin_process() {
+    if (active_processes.fetch_add(1, std::memory_order_relaxed) == 0) {
+        reset_cancel();
+    }
+}
+
+void RealCUGAN::end_process() {
+    active_processes.fetch_sub(1, std::memory_order_relaxed);
+}
+
+int RealCUGAN::active_process_count() const {
+    return active_processes.load(std::memory_order_relaxed);
+}
+
 #if _WIN32
 int RealCUGAN::load(const std::wstring& parampath, const std::wstring& modelpath)
 #else
@@ -99,10 +131,27 @@ int RealCUGAN::load(const std::string &parampath, const std::string &modelpath)
     if (vkdev) {
         // Use device capability flags for safer defaults
         const auto &info = vkdev->info;
-        net.opt.use_fp16_storage = info.support_fp16_storage();
-        net.opt.use_fp16_arithmetic = info.support_fp16_arithmetic();
-        net.opt.use_fp16_uniform = info.support_fp16_uniform();
-        net.opt.use_fp16_packed = info.support_fp16_packed();
+        const bool is_qualcomm = info.vendor_id() == 0x5143
+                                 || std::string(info.device_name()).find("Adreno") !=
+                                    std::string::npos;
+        const bool adreno_driver_risk = is_qualcomm && (
+                info.bug_corrupted_online_pipeline_cache()
+                || info.bug_buffer_image_load_zero()
+                || info.bug_storage_buffer_no_l1());
+
+        net.opt.use_fp16_storage = info.support_fp16_storage() && !adreno_driver_risk;
+        net.opt.use_fp16_arithmetic = info.support_fp16_arithmetic() && !adreno_driver_risk;
+        net.opt.use_fp16_uniform = info.support_fp16_uniform() && !adreno_driver_risk;
+        net.opt.use_fp16_packed = info.support_fp16_packed() && !adreno_driver_risk;
+
+        if (adreno_driver_risk) {
+            LOGW("Adreno safe mode: disabling fp16 options for %s "
+                 "(pipeline_cache=%d, buffer_image_zero=%d, storage_buffer_no_l1=%d)",
+                 info.device_name(),
+                 info.bug_corrupted_online_pipeline_cache() ? 1 : 0,
+                 info.bug_buffer_image_load_zero() ? 1 : 0,
+                 info.bug_storage_buffer_no_l1() ? 1 : 0);
+        }
     } else {
         net.opt.use_fp16_storage = false;
         net.opt.use_fp16_arithmetic = false;
@@ -257,6 +306,7 @@ int RealCUGAN::load(const std::string &parampath, const std::string &modelpath)
 
 int RealCUGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage,
                        const std::function<void(float)> &progress_listener) const {
+    RETURN_IF_CANCELLED();
     bool syncgap_needed = tilesize < std::max(inimage.w, inimage.h);
 
     if (!vkdev) {
@@ -310,6 +360,7 @@ int RealCUGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage,
 
     //#pragma omp parallel for num_threads(2)
     for (int yi = 0; yi < ytiles; yi++) {
+        RETURN_IF_CANCELLED();
         const int tile_h_nopad = std::min((yi + 1) * TILE_SIZE_Y, h) - yi * TILE_SIZE_Y;
 
         int prepadding_bottom = prepadding;
@@ -373,6 +424,7 @@ int RealCUGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage,
         }
 
         for (int xi = 0; xi < xtiles; xi++) {
+            RETURN_IF_CANCELLED();
             const int tile_w_nopad = std::min((xi + 1) * TILE_SIZE_X, w) - xi * TILE_SIZE_X;
 
             int prepadding_right = prepadding;
@@ -743,6 +795,8 @@ int RealCUGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage,
         }
     }
 
+    blob_vkallocator->clear();
+    staging_vkallocator->clear();
     vkdev->reclaim_blob_allocator(blob_vkallocator);
     vkdev->reclaim_staging_allocator(staging_vkallocator);
 
@@ -751,6 +805,7 @@ int RealCUGAN::process(const ncnn::Mat &inimage, ncnn::Mat &outimage,
 
 int RealCUGAN::process_cpu(const ncnn::Mat &inimage, ncnn::Mat &outimage,
                            const std::function<void(float)> &progress_listener) const {
+    RETURN_IF_CANCELLED();
     if (noise == -1 && scale == 1) {
         outimage = inimage;
         return 0;
@@ -771,6 +826,7 @@ int RealCUGAN::process_cpu(const ncnn::Mat &inimage, ncnn::Mat &outimage,
     const int ytiles = (h + TILE_SIZE_Y - 1) / TILE_SIZE_Y;
 
     for (int yi = 0; yi < ytiles; yi++) {
+        RETURN_IF_CANCELLED();
         const int tile_h_nopad = std::min((yi + 1) * TILE_SIZE_Y, h) - yi * TILE_SIZE_Y;
 
         int prepadding_bottom = prepadding;
@@ -785,6 +841,7 @@ int RealCUGAN::process_cpu(const ncnn::Mat &inimage, ncnn::Mat &outimage,
         int in_tile_y1 = std::min((yi + 1) * TILE_SIZE_Y + prepadding_bottom, h);
 
         for (int xi = 0; xi < xtiles; xi++) {
+            RETURN_IF_CANCELLED();
             const int tile_w_nopad = std::min((xi + 1) * TILE_SIZE_X, w) - xi * TILE_SIZE_X;
 
             int prepadding_right = prepadding;
@@ -1233,6 +1290,7 @@ int RealCUGAN::process_cpu(const ncnn::Mat &inimage, ncnn::Mat &outimage,
 
 int RealCUGAN::process_se(const ncnn::Mat &inimage, ncnn::Mat &outimage,
                           const std::function<void(float)> &progress_listener) const {
+    RETURN_IF_CANCELLED();
     ncnn::VkAllocator *blob_vkallocator = vkdev->acquire_blob_allocator();
     ncnn::VkAllocator *staging_vkallocator = vkdev->acquire_staging_allocator();
 
@@ -1242,48 +1300,54 @@ int RealCUGAN::process_se(const ncnn::Mat &inimage, ncnn::Mat &outimage,
     opt.staging_vkallocator = staging_vkallocator;
 
     FeatureCache cache;
+    int ret = 0;
+#define RETURN_PROCESS_SE_IF_FAILED(expr) do { ret = (expr); if (ret != 0) { cache.clear(); blob_vkallocator->clear(); staging_vkallocator->clear(); vkdev->reclaim_blob_allocator(blob_vkallocator); vkdev->reclaim_staging_allocator(staging_vkallocator); return ret; } } while (0)
 
     std::vector<std::string> in0 = {};
     std::vector<std::string> out0 = {"gap0"};
-    process_se_stage0(inimage, in0, out0, opt, cache, progress_listener);
+    RETURN_PROCESS_SE_IF_FAILED(process_se_stage0(inimage, in0, out0, opt, cache, progress_listener));
 
     std::vector<std::string> gap0 = {"gap0"};
-    process_se_sync_gap(inimage, gap0, opt, cache, progress_listener);
+    RETURN_PROCESS_SE_IF_FAILED(process_se_sync_gap(inimage, gap0, opt, cache, progress_listener));
 
     std::vector<std::string> in1 = {"gap0"};
     std::vector<std::string> out1 = {"gap1"};
-    process_se_stage0(inimage, in1, out1, opt, cache, progress_listener);
+    RETURN_PROCESS_SE_IF_FAILED(process_se_stage0(inimage, in1, out1, opt, cache, progress_listener));
 
     std::vector<std::string> gap1 = {"gap1"};
-    process_se_sync_gap(inimage, gap1, opt, cache, progress_listener);
+    RETURN_PROCESS_SE_IF_FAILED(process_se_sync_gap(inimage, gap1, opt, cache, progress_listener));
 
     std::vector<std::string> in2 = {"gap0", "gap1"};
     std::vector<std::string> out2 = {"gap2"};
-    process_se_stage0(inimage, in2, out2, opt, cache, progress_listener);
+    RETURN_PROCESS_SE_IF_FAILED(process_se_stage0(inimage, in2, out2, opt, cache, progress_listener));
 
     std::vector<std::string> gap2 = {"gap2"};
-    process_se_sync_gap(inimage, gap2, opt, cache, progress_listener);
+    RETURN_PROCESS_SE_IF_FAILED(process_se_sync_gap(inimage, gap2, opt, cache, progress_listener));
 
     std::vector<std::string> in3 = {"gap0", "gap1", "gap2"};
     std::vector<std::string> out3 = {"gap3"};
-    process_se_stage0(inimage, in3, out3, opt, cache, progress_listener);
+    RETURN_PROCESS_SE_IF_FAILED(process_se_stage0(inimage, in3, out3, opt, cache, progress_listener));
 
     std::vector<std::string> gap3 = {"gap3"};
-    process_se_sync_gap(inimage, gap3, opt, cache, progress_listener);
+    RETURN_PROCESS_SE_IF_FAILED(process_se_sync_gap(inimage, gap3, opt, cache, progress_listener));
 
     std::vector<std::string> in4 = {"gap0", "gap1", "gap2", "gap3"};
-    process_se_stage2(inimage, in4, outimage, opt, cache, progress_listener);
+    RETURN_PROCESS_SE_IF_FAILED(process_se_stage2(inimage, in4, outimage, opt, cache, progress_listener));
 
     cache.clear();
 
+    blob_vkallocator->clear();
+    staging_vkallocator->clear();
     vkdev->reclaim_blob_allocator(blob_vkallocator);
     vkdev->reclaim_staging_allocator(staging_vkallocator);
 
     return 0;
+#undef RETURN_PROCESS_SE_IF_FAILED
 }
 
 int RealCUGAN::process_se_rough(const ncnn::Mat &inimage, ncnn::Mat &outimage,
                                 const std::function<void(float)> &progress_listener) const {
+    RETURN_IF_CANCELLED();
     ncnn::VkAllocator *blob_vkallocator = vkdev->acquire_blob_allocator();
     ncnn::VkAllocator *staging_vkallocator = vkdev->acquire_staging_allocator();
 
@@ -1293,27 +1357,33 @@ int RealCUGAN::process_se_rough(const ncnn::Mat &inimage, ncnn::Mat &outimage,
     opt.staging_vkallocator = staging_vkallocator;
 
     FeatureCache cache;
+    int ret = 0;
+#define RETURN_PROCESS_SE_ROUGH_IF_FAILED(expr) do { ret = (expr); if (ret != 0) { cache.clear(); blob_vkallocator->clear(); staging_vkallocator->clear(); vkdev->reclaim_blob_allocator(blob_vkallocator); vkdev->reclaim_staging_allocator(staging_vkallocator); return ret; } } while (0)
 
     std::vector<std::string> in0 = {};
     std::vector<std::string> out0 = {"gap0", "gap1", "gap2", "gap3"};
-    process_se_stage0(inimage, in0, out0, opt, cache, progress_listener);
+    RETURN_PROCESS_SE_ROUGH_IF_FAILED(process_se_stage0(inimage, in0, out0, opt, cache, progress_listener));
 
     std::vector<std::string> gap0 = {"gap0", "gap1", "gap2", "gap3"};
-    process_se_sync_gap(inimage, gap0, opt, cache, progress_listener);
+    RETURN_PROCESS_SE_ROUGH_IF_FAILED(process_se_sync_gap(inimage, gap0, opt, cache, progress_listener));
 
     std::vector<std::string> in4 = {"gap0", "gap1", "gap2", "gap3"};
-    process_se_stage2(inimage, in4, outimage, opt, cache, progress_listener);
+    RETURN_PROCESS_SE_ROUGH_IF_FAILED(process_se_stage2(inimage, in4, outimage, opt, cache, progress_listener));
 
     cache.clear();
 
+    blob_vkallocator->clear();
+    staging_vkallocator->clear();
     vkdev->reclaim_blob_allocator(blob_vkallocator);
     vkdev->reclaim_staging_allocator(staging_vkallocator);
 
     return 0;
+#undef RETURN_PROCESS_SE_ROUGH_IF_FAILED
 }
 
 int RealCUGAN::process_se_very_rough(const ncnn::Mat &inimage, ncnn::Mat &outimage,
                                      const std::function<void(float)> &progress_listener) const {
+    RETURN_IF_CANCELLED();
     ncnn::VkAllocator *blob_vkallocator = vkdev->acquire_blob_allocator();
     ncnn::VkAllocator *staging_vkallocator = vkdev->acquire_staging_allocator();
 
@@ -1323,108 +1393,126 @@ int RealCUGAN::process_se_very_rough(const ncnn::Mat &inimage, ncnn::Mat &outima
     opt.staging_vkallocator = staging_vkallocator;
 
     FeatureCache cache;
+    int ret = 0;
+#define RETURN_PROCESS_SE_VERY_ROUGH_IF_FAILED(expr) do { ret = (expr); if (ret != 0) { cache.clear(); blob_vkallocator->clear(); staging_vkallocator->clear(); vkdev->reclaim_blob_allocator(blob_vkallocator); vkdev->reclaim_staging_allocator(staging_vkallocator); return ret; } } while (0)
 
     std::vector<std::string> in0 = {};
     std::vector<std::string> out0 = {"gap0", "gap1", "gap2", "gap3"};
-    process_se_very_rough_stage0(inimage, in0, out0, opt, cache, progress_listener);
+    RETURN_PROCESS_SE_VERY_ROUGH_IF_FAILED(process_se_very_rough_stage0(inimage, in0, out0, opt, cache, progress_listener));
 
     std::vector<std::string> gap0 = {"gap0", "gap1", "gap2", "gap3"};
-    process_se_very_rough_sync_gap(inimage, gap0, opt, cache, progress_listener);
+    RETURN_PROCESS_SE_VERY_ROUGH_IF_FAILED(process_se_very_rough_sync_gap(inimage, gap0, opt, cache, progress_listener));
 
     std::vector<std::string> in4 = {"gap0", "gap1", "gap2", "gap3"};
-    process_se_stage2(inimage, in4, outimage, opt, cache, progress_listener);
+    RETURN_PROCESS_SE_VERY_ROUGH_IF_FAILED(process_se_stage2(inimage, in4, outimage, opt, cache, progress_listener));
 
     cache.clear();
 
+    blob_vkallocator->clear();
+    staging_vkallocator->clear();
     vkdev->reclaim_blob_allocator(blob_vkallocator);
     vkdev->reclaim_staging_allocator(staging_vkallocator);
 
     return 0;
+#undef RETURN_PROCESS_SE_VERY_ROUGH_IF_FAILED
 }
 
 int RealCUGAN::process_cpu_se(const ncnn::Mat &inimage, ncnn::Mat &outimage,
                               const std::function<void(float)> &progress_listener) const {
+    RETURN_IF_CANCELLED();
     FeatureCache cache;
+    int ret = 0;
+#define RETURN_PROCESS_CPU_SE_IF_FAILED(expr) do { ret = (expr); if (ret != 0) { cache.clear(); return ret; } } while (0)
 
     std::vector<std::string> in0 = {};
     std::vector<std::string> out0 = {"gap0"};
-    process_cpu_se_stage0(inimage, in0, out0, cache, progress_listener);
+    RETURN_PROCESS_CPU_SE_IF_FAILED(process_cpu_se_stage0(inimage, in0, out0, cache, progress_listener));
 
     std::vector<std::string> gap0 = {"gap0"};
-    process_cpu_se_sync_gap(inimage, gap0, cache, progress_listener);
+    RETURN_PROCESS_CPU_SE_IF_FAILED(process_cpu_se_sync_gap(inimage, gap0, cache, progress_listener));
 
     std::vector<std::string> in1 = {"gap0"};
     std::vector<std::string> out1 = {"gap1"};
-    process_cpu_se_stage0(inimage, in1, out1, cache, progress_listener);
+    RETURN_PROCESS_CPU_SE_IF_FAILED(process_cpu_se_stage0(inimage, in1, out1, cache, progress_listener));
 
     std::vector<std::string> gap1 = {"gap1"};
-    process_cpu_se_sync_gap(inimage, gap1, cache, progress_listener);
+    RETURN_PROCESS_CPU_SE_IF_FAILED(process_cpu_se_sync_gap(inimage, gap1, cache, progress_listener));
 
     std::vector<std::string> in2 = {"gap0", "gap1"};
     std::vector<std::string> out2 = {"gap2"};
-    process_cpu_se_stage0(inimage, in2, out2, cache, progress_listener);
+    RETURN_PROCESS_CPU_SE_IF_FAILED(process_cpu_se_stage0(inimage, in2, out2, cache, progress_listener));
 
     std::vector<std::string> gap2 = {"gap2"};
-    process_cpu_se_sync_gap(inimage, gap2, cache, progress_listener);
+    RETURN_PROCESS_CPU_SE_IF_FAILED(process_cpu_se_sync_gap(inimage, gap2, cache, progress_listener));
 
     std::vector<std::string> in3 = {"gap0", "gap1", "gap2"};
     std::vector<std::string> out3 = {"gap3"};
-    process_cpu_se_stage0(inimage, in3, out3, cache, progress_listener);
+    RETURN_PROCESS_CPU_SE_IF_FAILED(process_cpu_se_stage0(inimage, in3, out3, cache, progress_listener));
 
     std::vector<std::string> gap3 = {"gap3"};
-    process_cpu_se_sync_gap(inimage, gap3, cache, progress_listener);
+    RETURN_PROCESS_CPU_SE_IF_FAILED(process_cpu_se_sync_gap(inimage, gap3, cache, progress_listener));
 
     std::vector<std::string> in4 = {"gap0", "gap1", "gap2", "gap3"};
-    process_cpu_se_stage2(inimage, in4, outimage, cache, progress_listener);
+    RETURN_PROCESS_CPU_SE_IF_FAILED(process_cpu_se_stage2(inimage, in4, outimage, cache, progress_listener));
 
     cache.clear();
 
     return 0;
+#undef RETURN_PROCESS_CPU_SE_IF_FAILED
 }
 
 int RealCUGAN::process_cpu_se_rough(const ncnn::Mat &inimage, ncnn::Mat &outimage,
                                     const std::function<void(float)> &progress_listener) const {
+    RETURN_IF_CANCELLED();
     FeatureCache cache;
+    int ret = 0;
+#define RETURN_PROCESS_CPU_SE_ROUGH_IF_FAILED(expr) do { ret = (expr); if (ret != 0) { cache.clear(); return ret; } } while (0)
 
     std::vector<std::string> in0 = {};
     std::vector<std::string> out0 = {"gap0", "gap1", "gap2", "gap3"};
-    process_cpu_se_stage0(inimage, in0, out0, cache, progress_listener);
+    RETURN_PROCESS_CPU_SE_ROUGH_IF_FAILED(process_cpu_se_stage0(inimage, in0, out0, cache, progress_listener));
 
     std::vector<std::string> gap0 = {"gap0", "gap1", "gap2", "gap3"};
-    process_cpu_se_sync_gap(inimage, gap0, cache, progress_listener);
+    RETURN_PROCESS_CPU_SE_ROUGH_IF_FAILED(process_cpu_se_sync_gap(inimage, gap0, cache, progress_listener));
 
     std::vector<std::string> in4 = {"gap0", "gap1", "gap2", "gap3"};
-    process_cpu_se_stage2(inimage, in4, outimage, cache, progress_listener);
+    RETURN_PROCESS_CPU_SE_ROUGH_IF_FAILED(process_cpu_se_stage2(inimage, in4, outimage, cache, progress_listener));
 
     cache.clear();
 
     return 0;
+#undef RETURN_PROCESS_CPU_SE_ROUGH_IF_FAILED
 }
 
 int RealCUGAN::process_cpu_se_very_rough(const ncnn::Mat &inimage, ncnn::Mat &outimage,
                                          const std::function<void(
                                                  float)> &progress_listener) const {
+    RETURN_IF_CANCELLED();
     FeatureCache cache;
+    int ret = 0;
+#define RETURN_PROCESS_CPU_SE_VERY_ROUGH_IF_FAILED(expr) do { ret = (expr); if (ret != 0) { cache.clear(); return ret; } } while (0)
 
     std::vector<std::string> in0 = {};
     std::vector<std::string> out0 = {"gap0", "gap1", "gap2", "gap3"};
-    process_cpu_se_very_rough_stage0(inimage, in0, out0, cache, progress_listener);
+    RETURN_PROCESS_CPU_SE_VERY_ROUGH_IF_FAILED(process_cpu_se_very_rough_stage0(inimage, in0, out0, cache, progress_listener));
 
     std::vector<std::string> gap0 = {"gap0", "gap1", "gap2", "gap3"};
-    process_cpu_se_very_rough_sync_gap(inimage, gap0, cache, progress_listener);
+    RETURN_PROCESS_CPU_SE_VERY_ROUGH_IF_FAILED(process_cpu_se_very_rough_sync_gap(inimage, gap0, cache, progress_listener));
 
     std::vector<std::string> in4 = {"gap0", "gap1", "gap2", "gap3"};
-    process_cpu_se_stage2(inimage, in4, outimage, cache, progress_listener);
+    RETURN_PROCESS_CPU_SE_VERY_ROUGH_IF_FAILED(process_cpu_se_stage2(inimage, in4, outimage, cache, progress_listener));
 
     cache.clear();
 
     return 0;
+#undef RETURN_PROCESS_CPU_SE_VERY_ROUGH_IF_FAILED
 }
 
 int RealCUGAN::process_se_stage0(const ncnn::Mat &inimage, const std::vector<std::string> &names,
                                  const std::vector<std::string> &outnames, const ncnn::Option &opt,
                                  FeatureCache &cache,
                                  const std::function<void(float)> &progress_listener) const {
+    RETURN_IF_CANCELLED();
     const unsigned char *pixeldata = (const unsigned char *) inimage.data;
     const int w = inimage.w;
     const int h = inimage.h;
@@ -1441,6 +1529,7 @@ int RealCUGAN::process_se_stage0(const ncnn::Mat &inimage, const std::vector<std
 
     //#pragma omp parallel for num_threads(2)
     for (int yi = 0; yi < ytiles; yi++) {
+        RETURN_IF_CANCELLED();
         const int tile_h_nopad = std::min((yi + 1) * TILE_SIZE_Y, h) - yi * TILE_SIZE_Y;
 
         int prepadding_bottom = prepadding;
@@ -1504,6 +1593,7 @@ int RealCUGAN::process_se_stage0(const ncnn::Mat &inimage, const std::vector<std
         }
 
         for (int xi = 0; xi < xtiles; xi++) {
+            RETURN_IF_CANCELLED();
             const int tile_w_nopad = std::min((xi + 1) * TILE_SIZE_X, w) - xi * TILE_SIZE_X;
 
             int prepadding_right = prepadding;
@@ -1696,6 +1786,7 @@ int RealCUGAN::process_se_stage0(const ncnn::Mat &inimage, const std::vector<std
 int RealCUGAN::process_se_stage2(const ncnn::Mat &inimage, const std::vector<std::string> &names,
                                  ncnn::Mat &outimage, const ncnn::Option &opt, FeatureCache &cache,
                                  const std::function<void(float)> &progress_listener) const {
+    RETURN_IF_CANCELLED();
     const unsigned char *pixeldata = (const unsigned char *) inimage.data;
     const int w = inimage.w;
     const int h = inimage.h;
@@ -1712,6 +1803,7 @@ int RealCUGAN::process_se_stage2(const ncnn::Mat &inimage, const std::vector<std
 
     //#pragma omp parallel for num_threads(2)
     for (int yi = 0; yi < ytiles; yi++) {
+        RETURN_IF_CANCELLED();
         const int tile_h_nopad = std::min((yi + 1) * TILE_SIZE_Y, h) - yi * TILE_SIZE_Y;
 
         int prepadding_bottom = prepadding;
@@ -1775,6 +1867,7 @@ int RealCUGAN::process_se_stage2(const ncnn::Mat &inimage, const std::vector<std
         }
 
         for (int xi = 0; xi < xtiles; xi++) {
+            RETURN_IF_CANCELLED();
             const int tile_w_nopad = std::min((xi + 1) * TILE_SIZE_X, w) - xi * TILE_SIZE_X;
 
             int prepadding_right = prepadding;
@@ -2165,6 +2258,7 @@ int RealCUGAN::process_se_stage2(const ncnn::Mat &inimage, const std::vector<std
 int RealCUGAN::process_se_sync_gap(const ncnn::Mat &inimage, const std::vector<std::string> &names,
                                    const ncnn::Option &opt, FeatureCache &cache,
                                    const std::function<void(float)> &progress_listener) const {
+    RETURN_IF_CANCELLED();
     const unsigned char *pixeldata = (const unsigned char *) inimage.data;
     const int w = inimage.w;
     const int h = inimage.h;
@@ -2179,7 +2273,9 @@ int RealCUGAN::process_se_sync_gap(const ncnn::Mat &inimage, const std::vector<s
 
     std::vector<std::vector<ncnn::VkMat> > feats(names.size());
     for (int yi = 0; yi < ytiles; yi++) {
+        RETURN_IF_CANCELLED();
         for (int xi = 0; xi < xtiles; xi++) {
+            RETURN_IF_CANCELLED();
             {
                 for (size_t i = 0; i < names.size(); i++) {
                     if (tta_mode) {
@@ -2265,7 +2361,9 @@ int RealCUGAN::process_se_sync_gap(const ncnn::Mat &inimage, const std::vector<s
 
 
     for (int yi = 0; yi < ytiles; yi++) {
+        RETURN_IF_CANCELLED();
         for (int xi = 0; xi < xtiles; xi++) {
+            RETURN_IF_CANCELLED();
             {
                 for (size_t i = 0; i < names.size(); i++) {
                     if (tta_mode) {
@@ -2289,6 +2387,7 @@ int RealCUGAN::process_se_very_rough_stage0(const ncnn::Mat &inimage,
                                             const ncnn::Option &opt, FeatureCache &cache,
                                             const std::function<void(
                                                     float)> &progress_listener) const {
+    RETURN_IF_CANCELLED();
     const unsigned char *pixeldata = (const unsigned char *) inimage.data;
     const int w = inimage.w;
     const int h = inimage.h;
@@ -2305,6 +2404,7 @@ int RealCUGAN::process_se_very_rough_stage0(const ncnn::Mat &inimage,
 
     //#pragma omp parallel for num_threads(2)
     for (int yi = 0; yi + 2 < ytiles; yi += 3) {
+        RETURN_IF_CANCELLED();
         const int tile_h_nopad = std::min((yi + 1) * TILE_SIZE_Y, h) - yi * TILE_SIZE_Y;
 
         int prepadding_bottom = prepadding;
@@ -2368,6 +2468,7 @@ int RealCUGAN::process_se_very_rough_stage0(const ncnn::Mat &inimage,
         }
 
         for (int xi = 0; xi + 2 < xtiles; xi += 3) {
+            RETURN_IF_CANCELLED();
             const int tile_w_nopad = std::min((xi + 1) * TILE_SIZE_X, w) - xi * TILE_SIZE_X;
 
             int prepadding_right = prepadding;
@@ -2562,6 +2663,7 @@ int RealCUGAN::process_se_very_rough_sync_gap(const ncnn::Mat &inimage,
                                               const ncnn::Option &opt, FeatureCache &cache,
                                               const std::function<void(
                                                       float)> &progress_listener) const {
+    RETURN_IF_CANCELLED();
     const unsigned char *pixeldata = (const unsigned char *) inimage.data;
     const int w = inimage.w;
     const int h = inimage.h;
@@ -2576,7 +2678,9 @@ int RealCUGAN::process_se_very_rough_sync_gap(const ncnn::Mat &inimage,
 
     std::vector<std::vector<ncnn::VkMat> > feats(names.size());
     for (int yi = 0; yi + 2 < ytiles; yi += 3) {
+        RETURN_IF_CANCELLED();
         for (int xi = 0; xi + 2 < xtiles; xi += 3) {
+            RETURN_IF_CANCELLED();
             {
                 for (size_t i = 0; i < names.size(); i++) {
                     if (tta_mode) {
@@ -2662,7 +2766,9 @@ int RealCUGAN::process_se_very_rough_sync_gap(const ncnn::Mat &inimage,
 
 
     for (int yi = 0; yi + 2 < ytiles; yi += 3) {
+        RETURN_IF_CANCELLED();
         for (int xi = 0; xi + 2 < xtiles; xi += 3) {
+            RETURN_IF_CANCELLED();
             {
                 for (size_t i = 0; i < names.size(); i++) {
                     if (tta_mode) {
@@ -2700,6 +2806,7 @@ int
 RealCUGAN::process_cpu_se_stage0(const ncnn::Mat &inimage, const std::vector<std::string> &names,
                                  const std::vector<std::string> &outnames, FeatureCache &cache,
                                  const std::function<void(float)> &progress_listener) const {
+    RETURN_IF_CANCELLED();
     const unsigned char *pixeldata = (const unsigned char *) inimage.data;
     const int w = inimage.w;
     const int h = inimage.h;
@@ -2715,6 +2822,7 @@ RealCUGAN::process_cpu_se_stage0(const ncnn::Mat &inimage, const std::vector<std
     const int ytiles = (h + TILE_SIZE_Y - 1) / TILE_SIZE_Y;
 
     for (int yi = 0; yi < ytiles; yi++) {
+        RETURN_IF_CANCELLED();
         const int tile_h_nopad = std::min((yi + 1) * TILE_SIZE_Y, h) - yi * TILE_SIZE_Y;
 
         int prepadding_bottom = prepadding;
@@ -2729,6 +2837,7 @@ RealCUGAN::process_cpu_se_stage0(const ncnn::Mat &inimage, const std::vector<std
         int in_tile_y1 = std::min((yi + 1) * TILE_SIZE_Y + prepadding_bottom, h);
 
         for (int xi = 0; xi < xtiles; xi++) {
+            RETURN_IF_CANCELLED();
             const int tile_w_nopad = std::min((xi + 1) * TILE_SIZE_X, w) - xi * TILE_SIZE_X;
 
             int prepadding_right = prepadding;
@@ -2993,6 +3102,7 @@ int
 RealCUGAN::process_cpu_se_stage2(const ncnn::Mat &inimage, const std::vector<std::string> &names,
                                  ncnn::Mat &outimage, FeatureCache &cache,
                                  const std::function<void(float)> &progress_listener) const {
+    RETURN_IF_CANCELLED();
     const unsigned char *pixeldata = (const unsigned char *) inimage.data;
     const int w = inimage.w;
     const int h = inimage.h;
@@ -3009,6 +3119,7 @@ RealCUGAN::process_cpu_se_stage2(const ncnn::Mat &inimage, const std::vector<std
     const int ytiles = (h + TILE_SIZE_Y - 1) / TILE_SIZE_Y;
 
     for (int yi = 0; yi < ytiles; yi++) {
+        RETURN_IF_CANCELLED();
         const int tile_h_nopad = std::min((yi + 1) * TILE_SIZE_Y, h) - yi * TILE_SIZE_Y;
 
         int prepadding_bottom = prepadding;
@@ -3023,6 +3134,7 @@ RealCUGAN::process_cpu_se_stage2(const ncnn::Mat &inimage, const std::vector<std
         int in_tile_y1 = std::min((yi + 1) * TILE_SIZE_Y + prepadding_bottom, h);
 
         for (int xi = 0; xi < xtiles; xi++) {
+            RETURN_IF_CANCELLED();
             const int tile_w_nopad = std::min((xi + 1) * TILE_SIZE_X, w) - xi * TILE_SIZE_X;
 
             int prepadding_right = prepadding;
@@ -3484,6 +3596,7 @@ int
 RealCUGAN::process_cpu_se_sync_gap(const ncnn::Mat &inimage, const std::vector<std::string> &names,
                                    FeatureCache &cache,
                                    const std::function<void(float)> &progress_listener) const {
+    RETURN_IF_CANCELLED();
     const unsigned char *pixeldata = (const unsigned char *) inimage.data;
     const int w = inimage.w;
     const int h = inimage.h;
@@ -3500,7 +3613,9 @@ RealCUGAN::process_cpu_se_sync_gap(const ncnn::Mat &inimage, const std::vector<s
 
     std::vector<std::vector<ncnn::Mat> > feats(names.size());
     for (int yi = 0; yi < ytiles; yi++) {
+        RETURN_IF_CANCELLED();
         for (int xi = 0; xi < xtiles; xi++) {
+            RETURN_IF_CANCELLED();
             {
                 for (size_t i = 0; i < names.size(); i++) {
                     if (tta_mode) {
@@ -3551,7 +3666,9 @@ RealCUGAN::process_cpu_se_sync_gap(const ncnn::Mat &inimage, const std::vector<s
     }
 
     for (int yi = 0; yi < ytiles; yi++) {
+        RETURN_IF_CANCELLED();
         for (int xi = 0; xi < xtiles; xi++) {
+            RETURN_IF_CANCELLED();
             {
                 for (size_t i = 0; i < names.size(); i++) {
                     if (tta_mode) {
@@ -3574,6 +3691,7 @@ int RealCUGAN::process_cpu_se_very_rough_stage0(const ncnn::Mat &inimage,
                                                 const std::vector<std::string> &outnames,
                                                 FeatureCache &cache, const std::function<void(
         float)> &progress_listener) const {
+    RETURN_IF_CANCELLED();
     const unsigned char *pixeldata = (const unsigned char *) inimage.data;
     const int w = inimage.w;
     const int h = inimage.h;
@@ -3589,6 +3707,7 @@ int RealCUGAN::process_cpu_se_very_rough_stage0(const ncnn::Mat &inimage,
     const int ytiles = (h + TILE_SIZE_Y - 1) / TILE_SIZE_Y;
 
     for (int yi = 0; yi + 2 < ytiles; yi += 3) {
+        RETURN_IF_CANCELLED();
         const int tile_h_nopad = std::min((yi + 1) * TILE_SIZE_Y, h) - yi * TILE_SIZE_Y;
 
         int prepadding_bottom = prepadding;
@@ -3603,6 +3722,7 @@ int RealCUGAN::process_cpu_se_very_rough_stage0(const ncnn::Mat &inimage,
         int in_tile_y1 = std::min((yi + 1) * TILE_SIZE_Y + prepadding_bottom, h);
 
         for (int xi = 0; xi + 2 < xtiles; xi += 3) {
+            RETURN_IF_CANCELLED();
             const int tile_w_nopad = std::min((xi + 1) * TILE_SIZE_X, w) - xi * TILE_SIZE_X;
 
             int prepadding_right = prepadding;
@@ -3866,6 +3986,7 @@ int RealCUGAN::process_cpu_se_very_rough_sync_gap(const ncnn::Mat &inimage,
                                                   const std::vector<std::string> &names,
                                                   FeatureCache &cache, const std::function<void(
         float)> progress_listener) const {
+    RETURN_IF_CANCELLED();
     const unsigned char *pixeldata = (const unsigned char *) inimage.data;
     const int w = inimage.w;
     const int h = inimage.h;
@@ -3882,7 +4003,9 @@ int RealCUGAN::process_cpu_se_very_rough_sync_gap(const ncnn::Mat &inimage,
 
     std::vector<std::vector<ncnn::Mat> > feats(names.size());
     for (int yi = 0; yi + 2 < ytiles; yi += 3) {
+        RETURN_IF_CANCELLED();
         for (int xi = 0; xi + 2 < xtiles; xi += 3) {
+            RETURN_IF_CANCELLED();
             {
                 for (size_t i = 0; i < names.size(); i++) {
                     if (tta_mode) {
@@ -3933,7 +4056,9 @@ int RealCUGAN::process_cpu_se_very_rough_sync_gap(const ncnn::Mat &inimage,
     }
 
     for (int yi = 0; yi + 2 < ytiles; yi += 3) {
+        RETURN_IF_CANCELLED();
         for (int xi = 0; xi + 2 < xtiles; xi += 3) {
+            RETURN_IF_CANCELLED();
             {
                 for (size_t i = 0; i < names.size(); i++) {
                     if (tta_mode) {

@@ -13,13 +13,17 @@
 #include "stb_image_write.h"
 #include "webp_image.h"
 #include <thread>
+#include <chrono>
 #include <algorithm>
+#include <new>
 
 #define LOG_TAG "RealCUGAN_ANDROID_SDK_NATIVE"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+#define REALCUGAN_CANCELLED -2
 
 struct ProgressCallback {
     JavaVM *vm = nullptr;
@@ -463,6 +467,14 @@ static void unlockBitmap(JNIEnv *env, jobject bitmap) {
     (void) AndroidBitmap_unlockPixels(env, bitmap);
 }
 
+static void throwOutOfMemory(JNIEnv *env, const char *message) {
+    if (env->ExceptionCheck()) return;
+    jclass oomExc = env->FindClass("java/lang/OutOfMemoryError");
+    if (oomExc) {
+        env->ThrowNew(oomExc, message);
+    }
+}
+
 // ---------- Preferred path: Bitmap -> ncnn::Mat -> Bitmap ----------
 extern "C" JNIEXPORT jboolean JNICALL
 Java_io_github_aoihoshino_realcugan_1android_1sdk_RealCUGAN_nativeProcessBitmap(
@@ -477,21 +489,29 @@ Java_io_github_aoihoshino_realcugan_1android_1sdk_RealCUGAN_nativeProcessBitmap(
 
     RealCUGAN *inst = find_realcugan(handle);
     if (!inst) {
-        LOGE("nativeProcessBitmap: instance of handle %lld not found", handle);
+        LOGE("nativeProcessBitmap: instance of handle %ld not found", (long) handle);
         return JNI_FALSE;
     }
+    inst->begin_process();
 
     AndroidBitmapInfo inInfo{}, outInfo{};
     void *inPix = nullptr;
     void *outPix = nullptr;
 
-    if (!lockBitmapRGBA8888(env, inBitmap, &inInfo, &inPix)) return JNI_FALSE;
+    if (!lockBitmapRGBA8888(env, inBitmap, &inInfo, &inPix)) {
+        inst->end_process();
+        return JNI_FALSE;
+    }
     if (!lockBitmapRGBA8888(env, outBitmap, &outInfo, &outPix)) {
         unlockBitmap(env, inBitmap);
+        inst->end_process();
         return JNI_FALSE;
     }
 
     bool ok = true;
+    bool wasCancelled = false;
+    bool wasOom = false;
+    std::string oomMessage;
     ProgressCallback *pcb = nullptr;
     std::function<void(float)> progressCb; // empty by default
 
@@ -541,6 +561,8 @@ Java_io_github_aoihoshino_realcugan_1android_1sdk_RealCUGAN_nativeProcessBitmap(
         auto *interleaved_tight = (unsigned char *) malloc(tight_size);
         if (!interleaved_tight) {
             LOGE("nativeProcessBitmap: OOM allocating %zu bytes for input", tight_size);
+            oomMessage = "RealCUGAN native input buffer allocation failed";
+            wasOom = true;
             ok = false;
         }
 
@@ -566,6 +588,8 @@ Java_io_github_aoihoshino_realcugan_1android_1sdk_RealCUGAN_nativeProcessBitmap(
             auto *out_tight = (unsigned char *) malloc(out_tight_size);
             if (!out_tight) {
                 LOGE("nativeProcessBitmap: OOM allocating %zu bytes for output", out_tight_size);
+                oomMessage = "RealCUGAN native output buffer allocation failed";
+                wasOom = true;
                 ok = false;
             }
 
@@ -575,7 +599,12 @@ Java_io_github_aoihoshino_realcugan_1android_1sdk_RealCUGAN_nativeProcessBitmap(
 
                 int ret = inst->process(in, out, progressCb);
                 if (ret != 0) {
-                    LOGE("nativeProcessBitmap: RealCUGAN::process failed (%d)", ret);
+                    if (ret == REALCUGAN_CANCELLED) {
+                        LOGI("nativeProcessBitmap: RealCUGAN::process cancelled");
+                        wasCancelled = true;
+                    } else {
+                        LOGE("nativeProcessBitmap: RealCUGAN::process failed (%d)", ret);
+                    }
                     ok = false;
                 } else {
                     // 将紧凑交错输出按 Bitmap 的 stride 写回
@@ -594,6 +623,10 @@ Java_io_github_aoihoshino_realcugan_1android_1sdk_RealCUGAN_nativeProcessBitmap(
             // 释放输入临时缓冲
             free(interleaved_tight);
         }
+    } catch (const std::bad_alloc &) {
+        oomMessage = "RealCUGAN native allocation failed";
+        wasOom = true;
+        ok = false;
     } catch (const std::exception &e) {
         env->ThrowNew(runtimeExc, e.what());
         ok = false;
@@ -609,7 +642,35 @@ Java_io_github_aoihoshino_realcugan_1android_1sdk_RealCUGAN_nativeProcessBitmap(
     }
     unlockBitmap(env, outBitmap);
     unlockBitmap(env, inBitmap);
+    inst->end_process();
+    if (wasCancelled && !env->ExceptionCheck()) {
+        jclass cancelExc = env->FindClass("java/util/concurrent/CancellationException");
+        if (cancelExc) {
+            env->ThrowNew(cancelExc, "RealCUGAN process cancelled");
+        }
+    }
+    if (wasOom) {
+        throwOutOfMemory(env, oomMessage.empty() ? "RealCUGAN native out of memory" : oomMessage.c_str());
+    }
     return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_io_github_aoihoshino_realcugan_1android_1sdk_RealCUGAN_nativeCancel(
+        JNIEnv * /*env*/, jclass, jlong handle) {
+    RealCUGAN *inst = find_realcugan(handle);
+    if (!inst) {
+        LOGW("nativeCancel: instance of handle %ld not found", (long) handle);
+        return;
+    }
+    inst->cancel();
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_io_github_aoihoshino_realcugan_1android_1sdk_RealCUGAN_nativeIsCancelled(
+        JNIEnv * /*env*/, jclass, jlong handle) {
+    RealCUGAN *inst = find_realcugan(handle);
+    return (inst && inst->is_cancelled()) ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -631,6 +692,12 @@ Java_io_github_aoihoshino_realcugan_1android_1sdk_RealCUGAN_nativeRelease(
     }
 
     // 在不持有 g_cache_mutex 的情况下释放实例
+    if (victim) {
+        victim->cancel();
+        while (victim->active_process_count() > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
     delete victim;
 
 

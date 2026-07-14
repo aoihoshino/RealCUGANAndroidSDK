@@ -77,6 +77,7 @@ class RealCUGANService : Service() {
     }
 
     override fun onDestroy() {
+        rcg?.cancel()
         tasks.values.forEach { it.cancel() }
         scope.cancel()
         rcg?.release()
@@ -185,6 +186,10 @@ class RealCUGANService : Service() {
             gate = Semaphore(1)
 
             if (cancelRunning) {
+                try {
+                    rcg?.cancel()
+                } catch (_: Throwable) {
+                }
                 tasks.keys.toList().forEach { id ->
                     try {
                         tasks[id]?.cancel()
@@ -227,31 +232,31 @@ class RealCUGANService : Service() {
                     return@launch
                 }
 
-                if (queueEnabled) {
-                    // 阻塞等待可用槽位
-                    gate.acquire()
-                } else {
-                    // 不排队：满额即失败
-                    // 不排队：满额即失败
-                    if (!gate.tryAcquire()) {
-                        onDone(Result.failure(IllegalStateException("Too many concurrent tasks")))
-                        return@launch
-                    }
-                }
-
-                // 通知：开始任务
+                var acquired = false
                 val title = displayName ?: getString(R.string.notif_title_processing_fallback)
-                updateNotification(titleText = title, percent = 0f, active = true)
-
-                // 复合进度回调：既更新通知，也转发给调用方
-                val composite = ProgressListener { p ->
-                    if (notificationsEnabled) {
-                        updateNotification(titleText = title, percent = p, active = true)
-                    }
-                    listener?.onProgress(p)
-                }
-
                 try {
+                    if (queueEnabled) {
+                        gate.acquire()
+                        acquired = true
+                    } else {
+                        if (!gate.tryAcquire()) {
+                            onDone(Result.failure(IllegalStateException("Too many concurrent tasks")))
+                            return@launch
+                        }
+                        acquired = true
+                    }
+
+                    // 通知：开始任务
+                    updateNotification(titleText = title, percent = 0f, active = true)
+
+                    // 复合进度回调：既更新通知，也转发给调用方
+                    val composite = ProgressListener { p ->
+                        if (notificationsEnabled) {
+                            updateNotification(titleText = title, percent = p, active = true)
+                        }
+                        listener?.onProgress(p)
+                    }
+
                     val bmp = inst.process(imageData, composite)
                     onDone(Result.success(bmp))
                     // 完成：进度 100% 并变更文案
@@ -272,9 +277,11 @@ class RealCUGANService : Service() {
                     }
                 } finally {
                     // 释放并发槽位
-                    try {
-                        gate.release()
-                    } catch (_: Throwable) {
+                    if (acquired) {
+                        try {
+                            gate.release()
+                        } catch (_: Throwable) {
+                        }
                     }
                     tasks.remove(id)
                 }
@@ -284,6 +291,7 @@ class RealCUGANService : Service() {
         }
 
         fun cancel(taskId: Int) {
+            rcg?.cancel()
             tasks[taskId]?.cancel()
         }
 

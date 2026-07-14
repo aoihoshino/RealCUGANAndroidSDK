@@ -1,44 +1,43 @@
 package io.github.aoihoshino.realcugan_android_sdk
 
-import android.content.ComponentName
+import android.app.ActivityManager
 import android.content.Context
-import android.content.Intent
-import android.content.ServiceConnection
 import android.graphics.Bitmap
 import android.os.Bundle
-import android.os.IBinder
+import android.os.Debug
 import android.util.Log
+import android.widget.Button
 import android.widget.ImageView
+import android.widget.ScrollView
+import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
-import io.github.aoihoshino.realcugan_android_sdk.R
-import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.coroutineScope
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
+import java.util.Locale
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.time.measureTime
 
 class MainActivity : AppCompatActivity() {
     companion object {
-        private const val TAG = "MainActivity"
+        private const val TAG = "RealCUGANStress"
+
+        private const val EXTRA_STRESS_AUTO = "stress_auto"
+        private const val EXTRA_STRESS_CLIENTS = "stress_clients"
+        private const val EXTRA_STRESS_LOOPS = "stress_loops"
+        private const val EXTRA_STRESS_INSTANCES = "stress_instances"
+        private const val EXTRA_STRESS_SHOW_LAST = "stress_show_last"
+        private const val EXTRA_STRESS_CANCEL_EVERY = "stress_cancel_every"
+        private const val EXTRA_STRESS_CANCEL_DELAY_MS = "stress_cancel_delay_ms"
+        private const val MAX_SCREEN_LOG_LINES = 500
     }
-
-    private var lastProgress: Float = -1f
-    private var lastProgressAt: Long = 0L
-    private lateinit var imageView: ImageView
-
-    // 选项覆盖集合（根据 RealCUGANOption 说明）：
-    // - modelName 决定合法的 scale / noise 取值
-    // - syncgap 仅允许 0..3
-    // - gpuId 可为 null（按库默认），或 >= -1（-1 为 CPU）
-    private val models = listOf(ModelName.NOSE, ModelName.PRO, ModelName.SE)
-    private val syncgaps = listOf(0, 3)               // 可改为 listOf(0,1,2,3) 做更细覆盖
-    private val gpuIds: List<Int?> = listOf(null)     // 如需 CPU/GPU 覆盖，设为 listOf(-1, 0)
 
     private data class Case(
         val name: String,
@@ -50,196 +49,321 @@ class MainActivity : AppCompatActivity() {
         val gpuId: Int?
     )
 
-    // 待测 scale 列表（可以根据需要调）
-    private val scales = listOf(4) // 如需更多覆盖：listOf(2, 3, 4)
-    private val testFiles = listOf(
-        "test1.png",
-        "test2.jpeg",
-        "test3.png"
+    private data class StressConfig(
+        val clients: Int,
+        val loops: Int,
+        val maxConcurrentInstances: Int,
+        val showLastBitmap: Boolean,
+        val cancelEvery: Int,
+        val cancelDelayMs: Long
     )
 
-    // —— 并发测试用配置（可按需调整） ——
-    private val serviceMaxConcurrent: Int = 2   // Service 侧最大并发许可数（Semaphore）
-    private val queueEnabled: Boolean = true    // true=排队，false=满额即失败
-    private val concurrentClients: Int = 4      // 并发提交的协程数量
-    private val loopsPerClient: Int = 2         // 每个协程重复处理轮数
+    private class ExpectedStressCancel(message: String) : RuntimeException(message)
 
-    // Service Binder 相关
-    private var binder: RealCUGANService.LocalBinder? = null
-    private val binderReady = CompletableDeferred<RealCUGANService.LocalBinder>()
+    private val testFiles = listOf("test1.png", "test2.jpeg", "test3.png")
+    private val stressCase = Case(
+        name = "se-up2x",
+        model = ModelName.SE,
+        noise = -1,
+        scale = 2,
+        syncgap = 3,
+        tta = false,
+        gpuId = null
+    )
 
-    // 外部可配置：是否启用前台通知（演示：这里从 Intent extra 读取，默认 true）
-    private val enableNotification: Boolean by lazy {
-        intent?.getBooleanExtra(RealCUGANService.EXTRA_ENABLE_NOTIFICATION, true) ?: true
-    }
+    private lateinit var imageView: ImageView
+    private lateinit var logScrollView: ScrollView
+    private lateinit var logTextView: TextView
+    private lateinit var statusText: TextView
+    private lateinit var startButton: Button
 
-    private val conn = object : ServiceConnection {
-        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-            binder = service as RealCUGANService.LocalBinder
-            if (!binderReady.isCompleted) binderReady.complete(binder!!)
-        }
-
-        override fun onServiceDisconnected(name: ComponentName?) {
-            binder = null
-        }
-    }
+    private val screenLogLines = ArrayDeque<String>()
+    private var displayedBitmap: Bitmap? = null
+    private var stressJob: Job? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-        imageView = findViewById<ImageView>(R.id.resultImageView)
+        imageView = findViewById(R.id.resultImageView)
+        logScrollView = findViewById(R.id.logScrollView)
+        logTextView = findViewById(R.id.logTextView)
+        statusText = findViewById(R.id.statusText)
+        startButton = findViewById(R.id.startStressButton)
 
-        // —— 启动与绑定 Service（外部可控制是否显示前台通知）——
-        val svcIntent = Intent(this, RealCUGANService::class.java)
-            .putExtra(RealCUGANService.EXTRA_ENABLE_NOTIFICATION, enableNotification)
+        startButton.setOnClickListener { startStressRun() }
 
-        if (enableNotification) {
-            // 需要前台通知：用前台启动
-            ContextCompat.startForegroundService(this, svcIntent)
-        } else {
-            // 不需要前台通知：普通 startService，避免 5s 内必须 startForeground 的约束
-            startService(svcIntent)
+        if (intent?.getBooleanExtra(EXTRA_STRESS_AUTO, true) != false) {
+            startStressRun()
         }
+    }
 
-        bindService(svcIntent, conn, Context.BIND_AUTO_CREATE)
+    private fun readStressConfig(): StressConfig = StressConfig(
+        clients = intent?.getIntExtra(EXTRA_STRESS_CLIENTS, 4)?.coerceAtLeast(1) ?: 4,
+        loops = intent?.getIntExtra(EXTRA_STRESS_LOOPS, 20)?.coerceAtLeast(1) ?: 20,
+        maxConcurrentInstances = intent?.getIntExtra(EXTRA_STRESS_INSTANCES, 2)
+            ?.coerceAtLeast(1) ?: 2,
+        showLastBitmap = intent?.getBooleanExtra(EXTRA_STRESS_SHOW_LAST, false) ?: false,
+        cancelEvery = intent?.getIntExtra(EXTRA_STRESS_CANCEL_EVERY, 7)?.coerceAtLeast(0) ?: 7,
+        cancelDelayMs = intent?.getLongExtra(EXTRA_STRESS_CANCEL_DELAY_MS, 300L)
+            ?.coerceAtLeast(0L) ?: 300L
+    )
 
-        // 通过 Service 处理：等待 Binder → 初始化 → 逐个处理
-        lifecycleScope.launch(Dispatchers.IO) {
-            val b = binderReady.await()
+    private fun startStressRun() {
+        if (stressJob?.isActive == true) return
 
-            // 配置 Service 并发闸
-            b.configureConcurrency(max = serviceMaxConcurrent, queue = queueEnabled)
+        stressJob = lifecycleScope.launch(Dispatchers.IO) {
+            val config = readStressConfig()
+            val submitted = AtomicInteger(0)
+            val successes = AtomicInteger(0)
+            val cancellations = AtomicInteger(0)
+            val failures = AtomicInteger(0)
+            val total = config.clients * config.loops * testFiles.size
+            val assetBytes = testFiles.associateWith { name ->
+                assets.open(name).use { it.readBytes() }
+            }
+            val instanceGate = Semaphore(config.maxConcurrentInstances)
 
-            // 基础测试用例：单一默认 Case
-            val cases = listOf(
-                Case(
-                    name = "basic",
-                    model = ModelName.SE,
-                    noise = -1,
-                    scale = 2,
-                    syncgap = 3,
-                    tta = false,
-                    gpuId = null
-                )
+            withContext(Dispatchers.Main) {
+                clearScreenLog()
+                startButton.isEnabled = false
+                statusText.text = "Stress running: 0/$total"
+                appendScreenLog("Stress running: 0/$total")
+            }
+
+            logMemory("before")
+            logInfo(
+                "Begin stress case=${stressCase.name}, clients=${config.clients}, " +
+                        "loops=${config.loops}, maxInstances=${config.maxConcurrentInstances}, " +
+                        "showLast=${config.showLastBitmap}, cancelEvery=${config.cancelEvery}, " +
+                        "cancelDelayMs=${config.cancelDelayMs}"
             )
-            val totalImages = concurrentClients * loopsPerClient * testFiles.size * cases.size
-            val totalCost = measureTime {
-                for (case in cases) {
-                    // 每个用例单独初始化（确保 native 参数生效）
-                    b.init(
-                        RealCUGANOption(
-                            context = applicationContext,
-                            noise = case.noise,
-                            scale = case.scale,
-                            syncgap = case.syncgap,
-                            modelName = case.model,
-                            ttaMode = case.tta,
-                            gpuId = case.gpuId
-                        )
-                    )
 
-                    Log.i(
-                        TAG,
-                        "==== Begin Concurrency Case: ${case.name} | clients=$concurrentClients loops=$loopsPerClient svcMax=$serviceMaxConcurrent queue=$queueEnabled ===="
-                    )
-
-                    val caseCost = measureTime {
-                        coroutineScope {
-                            repeat(concurrentClients) { clientIdx ->
-                                launch(Dispatchers.IO) {
-                                    repeat(loopsPerClient) { loopIdx ->
-                                        for (filename in testFiles) {
-                                            // 重置节流进度，避免跨任务沿用
-                                            lastProgress = -1f
-                                            lastProgressAt = 0L
-
-                                            val bytes = assets.open(filename).use { it.readBytes() }
-                                            val displayName =
-                                                "${case.name}::C$clientIdx-L$loopIdx::$filename"
-                                            try {
-                                                val bmp = awaitProcess(b, bytes, displayName)
-                                                // 为降低 UI 干扰，这里不必每次都刷新到 ImageView；如需观察可以放开以下代码：
-                                                // withContext(Dispatchers.Main) { imageView.setImageBitmap(bmp) }
-                                                Log.i(
-                                                    TAG,
-                                                    "OK ${displayName} → ${bmp.width}×${bmp.height}"
-                                                )
-                                            } catch (t: Throwable) {
-                                                Log.e(TAG, "FAIL ${displayName}: ${t.message}")
-                                            }
-                                        }
-                                    }
+            val elapsed = measureTime {
+                coroutineScope {
+                    repeat(config.clients) { clientIdx ->
+                        launch(Dispatchers.IO) {
+                            repeat(config.loops) { loopIdx ->
+                                for ((filename, bytes) in assetBytes) {
+                                    val taskNo = submitted.incrementAndGet()
+                                    val cancelThis = config.cancelEvery > 0 &&
+                                            taskNo % config.cancelEvery == 0
+                                    val displayName =
+                                        "${stressCase.name}::#$taskNo::C$clientIdx-L$loopIdx::$filename"
+                                    runOneStressTask(
+                                        gate = instanceGate,
+                                        bytes = bytes,
+                                        displayName = displayName,
+                                        cancelThis = cancelThis,
+                                        cancelDelayMs = config.cancelDelayMs,
+                                        total = total,
+                                        successes = successes,
+                                        cancellations = cancellations,
+                                        failures = failures,
+                                        showBitmap = config.showLastBitmap
+                                    )
                                 }
                             }
                         }
                     }
-
-                    Log.i(TAG, "==== End Case: ${case.name}, cost=${caseCost} ====")
                 }
             }
-            Log.i(TAG, "==== Concurrency Test Done: images=$totalImages, total=$totalCost ====")
 
-            // —— 测试完成：回收 Service ——
-            try {
-                withContext(Dispatchers.Main) {
-                    binder?.dispose() // 调用 Service 提供的释放方法（需在 LocalBinder 实现）
-                    unbindService(conn)
-                    stopService(Intent(this@MainActivity, RealCUGANService::class.java))
-                }
-            } catch (t: Throwable) {
-                Log.e(TAG, "Error stopping service: ${t.message}")
+            logMemory("after")
+            logInfo(
+                "Stress done ok=${successes.get()}, cancel=${cancellations.get()}, " +
+                        "fail=${failures.get()}, total=$total, cost=$elapsed"
+            )
+
+            withContext(Dispatchers.Main) {
+                statusText.text =
+                    "Stress done: ok=${successes.get()} cancel=${cancellations.get()} fail=${failures.get()} $elapsed"
+                appendScreenLog(statusText.text.toString())
+                startButton.isEnabled = true
             }
         }
     }
 
-    private suspend fun awaitProcess(
-        b: RealCUGANService.LocalBinder,
+    private suspend fun runOneStressTask(
+        gate: Semaphore,
         bytes: ByteArray,
-        displayName: String
-    ): Bitmap = suspendCancellableCoroutine { cont ->
-        val taskId = b.process(
-            imageData = bytes,
-            displayName = displayName,
-            listener = { p ->
-                // 在主线程打印/更新（节流：每提升≥1%或间隔≥200ms再更新一次）
-                lifecycleScope.launch(Dispatchers.Main) {
-                    val now = System.currentTimeMillis()
-                    if (p - lastProgress >= 1f || now - lastProgressAt >= 200) {
-                        lastProgress = p
-                        lastProgressAt = now
-                        Log.i(TAG, String.format("%s Processing %.2f%%", displayName, p))
+        displayName: String,
+        cancelThis: Boolean,
+        cancelDelayMs: Long,
+        total: Int,
+        successes: AtomicInteger,
+        cancellations: AtomicInteger,
+        failures: AtomicInteger,
+        showBitmap: Boolean
+    ) {
+        var rcg: RealCUGAN? = null
+        try {
+            val bmp = gate.withPermit {
+                val instance = RealCUGAN.create(
+                    RealCUGANOption(
+                        context = applicationContext,
+                        noise = stressCase.noise,
+                        scale = stressCase.scale,
+                        syncgap = stressCase.syncgap,
+                        modelName = stressCase.model,
+                        ttaMode = stressCase.tta,
+                        gpuId = stressCase.gpuId
+                    )
+                )
+                rcg = instance
+                logInfo("NEW instance $displayName")
+                try {
+                    coroutineScope {
+                        val cancelJob = if (cancelThis) {
+                            launch {
+                                delay(cancelDelayMs)
+                                logInfo("CANCEL $displayName after ${cancelDelayMs}ms")
+                                instance.cancel()
+                            }
+                        } else {
+                            null
+                        }
+
+                        try {
+                            instance.process(bytes) { p ->
+                                if (p == 0f || p >= 100f) {
+                                    logInfo(
+                                        String.format(Locale.US, "%s %.1f%%", displayName, p)
+                                    )
+                                }
+                            }
+                        } catch (t: CancellationException) {
+                            if (cancelThis) {
+                                throw ExpectedStressCancel("cancelled as expected")
+                            }
+                            throw t
+                        } finally {
+                            cancelJob?.cancel()
+                        }
+                    }
+                } finally {
+                    try {
+                        instance.release()
+                    } finally {
+                        rcg = null
                     }
                 }
             }
-        ) { result ->
-            result.onSuccess { bmp ->
-                if (cont.isActive) {
-                    runOnUiThread {
-                        imageView.setImageBitmap(bmp)
-                    }
-                    cont.resume(bmp)
+            val done = successes.incrementAndGet() + cancellations.get() + failures.get()
+            logInfo("OK $displayName -> ${bmp.width}x${bmp.height}, $done/$total")
+
+            if (showBitmap) {
+                withContext(Dispatchers.Main) {
+                    showResultBitmap(bmp)
                 }
-            }.onFailure { t ->
-                if (cont.isActive) cont.resumeWithException(t)
+            } else {
+                bmp.recycle()
             }
-        }
-        cont.invokeOnCancellation {
+
+            if (done == 1 || done % 5 == 0 || done == total) {
+                logMemory("progress $done/$total")
+                withContext(Dispatchers.Main) {
+                    statusText.text = "Stress running: $done/$total"
+                    appendScreenLog(statusText.text.toString())
+                }
+            }
+        } catch (t: ExpectedStressCancel) {
+            val done = successes.get() + cancellations.incrementAndGet() + failures.get()
+            logInfo("CANCELLED $displayName: ${t.message}, $done/$total")
+            if (done == 1 || done % 5 == 0 || done == total) {
+                logMemory("cancel $done/$total")
+                withContext(Dispatchers.Main) {
+                    statusText.text = "Stress running: $done/$total, cancel=${cancellations.get()}"
+                    appendScreenLog(statusText.text.toString())
+                }
+            }
+        } catch (t: Throwable) {
             try {
-                b.cancel(taskId)
+                rcg?.cancel()
             } catch (_: Throwable) {
             }
+            try {
+                rcg?.release()
+            } catch (_: Throwable) {
+            }
+            if (t is CancellationException) {
+                throw t
+            }
+            val done = successes.get() + cancellations.get() + failures.incrementAndGet()
+            logError("FAIL $displayName: ${t.javaClass.simpleName}: ${t.message}", t)
+            logMemory("failure $done/$total")
+            withContext(Dispatchers.Main) {
+                statusText.text = "Stress running: $done/$total, fail=${failures.get()}"
+                appendScreenLog(statusText.text.toString())
+            }
         }
     }
 
-    override fun onStop() {
-        super.onStop()
-        try {
-            unbindService(conn)
-        } catch (_: IllegalArgumentException) {
+    private fun showResultBitmap(bitmap: Bitmap) {
+        val old = displayedBitmap
+        imageView.setImageBitmap(bitmap)
+        displayedBitmap = bitmap
+        if (old != null && old !== bitmap && !old.isRecycled) {
+            old.recycle()
         }
     }
+
+    private fun logMemory(stage: String) {
+        val runtime = Runtime.getRuntime()
+        val usedJava = runtime.totalMemory() - runtime.freeMemory()
+        val maxJava = runtime.maxMemory()
+        val pssKb = getProcessPssKb()
+        logInfo(
+            "MEM[$stage] java=${formatBytes(usedJava)}/${formatBytes(maxJava)}, pss=${pssKb / 1024}MB"
+        )
+    }
+
+    private fun logInfo(message: String) {
+        Log.i(TAG, message)
+        lifecycleScope.launch(Dispatchers.Main) {
+            appendScreenLog(message)
+        }
+    }
+
+    private fun logError(message: String, throwable: Throwable? = null) {
+        if (throwable == null) {
+            Log.e(TAG, message)
+        } else {
+            Log.e(TAG, message, throwable)
+        }
+        lifecycleScope.launch(Dispatchers.Main) {
+            appendScreenLog(message)
+        }
+    }
+
+    private fun clearScreenLog() {
+        screenLogLines.clear()
+        logTextView.text = ""
+    }
+
+    private fun appendScreenLog(message: String) {
+        screenLogLines.addLast(message)
+        while (screenLogLines.size > MAX_SCREEN_LOG_LINES) {
+            screenLogLines.removeFirst()
+        }
+        logTextView.text = screenLogLines.joinToString(separator = "\n", postfix = "\n")
+        logScrollView.post {
+            logScrollView.fullScroll(ScrollView.FOCUS_DOWN)
+        }
+    }
+
+    private fun getProcessPssKb(): Int {
+        val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val info = am.getProcessMemoryInfo(intArrayOf(android.os.Process.myPid()))
+        return info.firstOrNull()?.totalPss ?: Debug.getPss().toInt()
+    }
+
+    private fun formatBytes(bytes: Long): String =
+        String.format(Locale.US, "%.1fMB", bytes / (1024.0 * 1024.0))
 
     override fun onDestroy() {
+        stressJob?.cancel()
+        displayedBitmap?.recycle()
+        displayedBitmap = null
         super.onDestroy()
     }
 }
