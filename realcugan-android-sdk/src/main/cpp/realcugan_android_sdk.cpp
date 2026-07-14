@@ -103,15 +103,16 @@ namespace std {
 struct CUGANEntry {
     jlong handle;
     RealCUGAN *inst;
+    CUGANParams params;
 };
 
 // ncnn初始化锁
 static std::mutex gpu_mutex;
 static bool gpu_initialized = false;
 
-// realcugan序列锁
+// realcugan实例表锁
 static std::mutex g_cache_mutex;
-static std::unordered_map<CUGANParams, CUGANEntry> g_cache;
+static std::unordered_map<jlong, CUGANEntry> g_instances;
 
 // handler
 static std::mutex handler_mutex;
@@ -130,7 +131,7 @@ void ensure_ncnn_gpu() {
 void release_ncnn_gpu() {
     std::lock_guard<std::mutex> lg(gpu_mutex);
     std::lock_guard<std::mutex> lg2(g_cache_mutex);
-    if (g_cache.empty() && gpu_initialized) {
+    if (g_instances.empty() && gpu_initialized) {
         ncnn::destroy_gpu_instance();
         gpu_initialized = false;
     }
@@ -140,15 +141,26 @@ RealCUGAN *find_realcugan(jlong handle) {
     RealCUGAN *inst = nullptr;
     {
         std::lock_guard<std::mutex> lk(g_cache_mutex);
-        for (auto &kv: g_cache) {
-            if (kv.second.handle == handle) {
-                inst = kv.second.inst;
-                LOGI("found realcugan: handle=%ld inst=%p options=%s",
-                     (long) handle, (void *) inst, kv.first.toString().c_str());
-                break;
-            }
+        auto it = g_instances.find(handle);
+        if (it != g_instances.end()) {
+            inst = it->second.inst;
+            LOGI("found realcugan: handle=%ld inst=%p options=%s",
+                 (long) handle, (void *) inst, it->second.params.toString().c_str());
         }
     }
+    return inst;
+}
+
+RealCUGAN *acquire_realcugan_for_process(jlong handle) {
+    std::lock_guard<std::mutex> lk(g_cache_mutex);
+    auto it = g_instances.find(handle);
+    if (it == g_instances.end()) {
+        return nullptr;
+    }
+    RealCUGAN *inst = it->second.inst;
+    inst->begin_process();
+    LOGI("acquire realcugan: handle=%ld inst=%p options=%s",
+         (long) handle, (void *) inst, it->second.params.toString().c_str());
     return inst;
 }
 
@@ -175,8 +187,11 @@ Java_io_github_aoihoshino_realcugan_1android_1sdk_RealCUGAN_nativeInitialize(
         jobject ttaModeObj,
         jobject gpuidObj
 ) {
-    if (!g_cache.empty()) {
-        LOGW("nativeInitialize: You have loaded more than one RealCUGAN instance. Too many RealCUGAN model being loaded can cause the heap to grow too large, leading to OOM.");
+    {
+        std::lock_guard<std::mutex> lk(g_cache_mutex);
+        if (!g_instances.empty()) {
+            LOGW("nativeInitialize: You have loaded more than one RealCUGAN instance. Too many RealCUGAN model being loaded can cause the heap to grow too large, leading to OOM.");
+        }
     }
     // 1. 异常类
     jclass runtimeExc = env->FindClass("java/lang/RuntimeException");
@@ -218,13 +233,6 @@ Java_io_github_aoihoshino_realcugan_1android_1sdk_RealCUGAN_nativeInitialize(
     LOGI("initialize(): using GPU %d", gpuId);
 
     CUGANParams key{noise, scale, syncgap, ttaMode, gpuId, modelDir};
-    {
-        std::lock_guard<std::mutex> lk(g_cache_mutex);
-        auto it = g_cache.find(key);
-        if (it != g_cache.end()) {
-            return it->second.handle;
-        }
-    }
 
     // 4. 基本边界检查（syncgap, gpuId 先行）
     if (syncgap < 0 || syncgap > 3) {
@@ -418,6 +426,8 @@ Java_io_github_aoihoshino_realcugan_1android_1sdk_RealCUGAN_nativeInitialize(
         }
     }
     catch (const std::exception &e) {
+        delete inst;
+        release_ncnn_gpu();
         env->ThrowNew(runtimeExc, e.what());
         return -1;
     }
@@ -430,8 +440,10 @@ Java_io_github_aoihoshino_realcugan_1android_1sdk_RealCUGAN_nativeInitialize(
     }
     {
         std::lock_guard<std::mutex> lk2(g_cache_mutex);
-        g_cache[key] = CUGANEntry{handle, inst};
+        g_instances.emplace(handle, CUGANEntry{handle, inst, key});
     }
+    LOGI("nativeInitialize: handle=%ld inst=%p options=%s",
+         (long) handle, (void *) inst, key.toString().c_str());
     return handle;
 }
 
@@ -487,12 +499,11 @@ Java_io_github_aoihoshino_realcugan_1android_1sdk_RealCUGAN_nativeProcessBitmap(
     jclass runtimeExc = env->FindClass("java/lang/RuntimeException");
     if (!runtimeExc) return JNI_FALSE;
 
-    RealCUGAN *inst = find_realcugan(handle);
+    RealCUGAN *inst = acquire_realcugan_for_process(handle);
     if (!inst) {
         LOGE("nativeProcessBitmap: instance of handle %ld not found", (long) handle);
         return JNI_FALSE;
     }
-    inst->begin_process();
 
     AndroidBitmapInfo inInfo{}, outInfo{};
     void *inPix = nullptr;
@@ -658,36 +669,36 @@ Java_io_github_aoihoshino_realcugan_1android_1sdk_RealCUGAN_nativeProcessBitmap(
 extern "C" JNIEXPORT void JNICALL
 Java_io_github_aoihoshino_realcugan_1android_1sdk_RealCUGAN_nativeCancel(
         JNIEnv * /*env*/, jclass, jlong handle) {
-    RealCUGAN *inst = find_realcugan(handle);
-    if (!inst) {
+    std::lock_guard<std::mutex> lk(g_cache_mutex);
+    auto it = g_instances.find(handle);
+    if (it == g_instances.end()) {
         LOGW("nativeCancel: instance of handle %ld not found", (long) handle);
-        return;
+    } else {
+        it->second.inst->cancel();
     }
-    inst->cancel();
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_io_github_aoihoshino_realcugan_1android_1sdk_RealCUGAN_nativeIsCancelled(
         JNIEnv * /*env*/, jclass, jlong handle) {
-    RealCUGAN *inst = find_realcugan(handle);
-    return (inst && inst->is_cancelled()) ? JNI_TRUE : JNI_FALSE;
+    std::lock_guard<std::mutex> lk(g_cache_mutex);
+    auto it = g_instances.find(handle);
+    return (it != g_instances.end() && it->second.inst->is_cancelled()) ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_io_github_aoihoshino_realcugan_1android_1sdk_RealCUGAN_nativeRelease(
         JNIEnv * /*env*/, jclass, jlong handle) {
-    // 先从缓存安全移除，再在锁外 delete，避免析构里间接拿锁/阻塞造成 ANR
+    // 先从实例表安全移除，再在锁外 delete，避免析构里间接拿锁/阻塞造成 ANR
     RealCUGAN *victim = nullptr;
     bool shouldDestroyGpu = false;
     {
         std::lock_guard<std::mutex> lk(g_cache_mutex);
-        for (auto it = g_cache.begin(); it != g_cache.end(); ++it) {
-            if (it->second.handle == handle) {
-                victim = it->second.inst;
-                g_cache.erase(it);
-                shouldDestroyGpu = g_cache.empty();
-                break;
-            }
+        auto it = g_instances.find(handle);
+        if (it != g_instances.end()) {
+            victim = it->second.inst;
+            g_instances.erase(it);
+            shouldDestroyGpu = g_instances.empty();
         }
     }
 
